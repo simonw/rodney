@@ -1,0 +1,65 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <title>Accessible Bookstore</title>
+</head>
+<body>
+  <a href="#main" class="skip-link">Skip to main content</a>
+  <header>
+    <nav aria-label="Primary">
+      <ul>
+        <li><a href="/">Home</a></li>
+        <li><a href="/catalog">Catalog</a></li>
+        <li><a href="/cart" aria-current="page">Cart</a></li>
+      </ul>
+    </nav>
+  </header>
+  <main id="main">
+    <h1>Shopping Cart</h1>
+    <section aria-label="Cart items">
+      <table>
+        <caption>Your cart contains 2 items</caption>
+        <thead>
+          <tr>
+            <th scope="col">Book</th>
+            <th scope="col">Price</th>
+            <th scope="col">Quantity</th>
+            <th scope="col">Actions</th>
+          </tr>
+        </thead>
+        <tbody>
+          <tr>
+            <td>The Great Gatsby</td>
+            <td>$12.99</td>
+            <td><input type="number" aria-label="Quantity for The Great Gatsby" value="1" min="1" max="10"></td>
+            <td><button aria-label="Remove The Great Gatsby">Remove</button></td>
+          </tr>
+          <tr>
+            <td>1984</td>
+            <td>$9.99</td>
+            <td><input type="number" aria-label="Quantity for 1984" value="2" min="1" max="10"></td>
+            <td><button aria-label="Remove 1984">Remove</button></td>
+          </tr>
+        </tbody>
+      </table>
+    </section>
+    <form aria-label="Checkout">
+      <fieldset>
+        <legend>Promo Code</legend>
+        <label for="promo">Enter code</label>
+        <input id="promo" type="text" placeholder="e.g. SAVE20">
+        <button type="submit">Apply</button>
+      </fieldset>
+    </form>
+    <div role="region" aria-label="Order summary">
+      <p>Subtotal: <strong>$32.97</strong></p>
+      <button id="checkout-btn" type="button">Proceed to Checkout</button>
+      <button id="continue-btn" type="button" disabled>Continue Shopping</button>
+    </div>
+  </main>
+  <footer>
+    <p>&copy; 2026 Accessible Bookstore</p>
+  </footer>
+</body>
+</html>
