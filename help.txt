@@ -51,6 +51,11 @@ Element queries:
   rodney count <selector>         Count matching elements
   rodney visible <selector>       Check if element is visible (exit 0/1)
 
+Accessibility:
+  rodney ax-tree [--depth N] [--json]       Dump accessibility tree
+  rodney ax-find [--name N] [--role R] [--json]  Find accessible nodes
+  rodney ax-node <selector> [--json]        Show accessibility info for element
+
 Options:
   --version                       Print version and exit
   --help, -h, help                Show this help message
