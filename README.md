@@ -125,6 +125,37 @@ rodney count "li.item"      # Print number of matching elements
 rodney visible "#modal"     # Exit 0 if visible, exit 1 if not
 ```
 
+### Accessibility testing
+
+```bash
+rodney ax-tree                           # Dump full accessibility tree
+rodney ax-tree --depth 3                 # Limit tree depth
+rodney ax-tree --json                    # Output as JSON
+
+rodney ax-find --role button             # Find all buttons
+rodney ax-find --name "Submit"           # Find by accessible name
+rodney ax-find --role link --name "Home" # Combine filters
+rodney ax-find --role button --json      # Output as JSON
+
+rodney ax-node "#submit-btn"             # Inspect element's a11y properties
+rodney ax-node "h1" --json               # Output as JSON
+```
+
+These commands use Chrome's [Accessibility CDP domain](https://chromedevtools.github.io/devtools-protocol/tot/Accessibility/) to expose what assistive technologies see. `ax-tree` uses `getFullAXTree`, `ax-find` uses `queryAXTree`, and `ax-node` uses `getPartialAXTree`.
+
+```bash
+# CI check: verify all buttons have accessible names
+rodney ax-find --role button --json | python3 -c "
+import json, sys
+buttons = json.load(sys.stdin)
+unnamed = [b for b in buttons if not b.get('name', {}).get('value')]
+if unnamed:
+    print(f'FAIL: {len(unnamed)} button(s) missing accessible name')
+    sys.exit(1)
+print(f'PASS: all {len(buttons)} buttons have accessible names')
+"
+```
+
 ### Shell scripting examples
 
 ```bash
@@ -182,6 +213,7 @@ The tool uses the [rod](https://github.com/go-rod/rod) Go library which communic
 - **Each command** creates a new rod `Browser` connection to the same Chrome instance, executes the operation, and disconnects
 - **Element queries** use rod's built-in auto-wait with a configurable timeout (default 30s)
 - **JS evaluation** wraps user expressions in arrow functions as required by rod's `Eval`
+- **Accessibility commands** call CDP's Accessibility domain directly via rod's `proto` package (`getFullAXTree`, `queryAXTree`, `getPartialAXTree`)
 
 ## Dependencies
 
@@ -226,3 +258,6 @@ The tool uses the [rod](https://github.com/go-rod/rod) Go library which communic
 | `exists` | `<selector>` | Check element exists (exit code) |
 | `count` | `<selector>` | Count matching elements |
 | `visible` | `<selector>` | Check element visible (exit code) |
+| `ax-tree` | `[--depth N] [--json]` | Dump accessibility tree |
+| `ax-find` | `[--name N] [--role R] [--json]` | Find accessible nodes |
+| `ax-node` | `<selector> [--json]` | Show element accessibility info |
