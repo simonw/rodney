@@ -261,3 +261,62 @@ The tool uses the [rod](https://github.com/go-rod/rod) Go library which communic
 | `ax-tree` | `[--depth N] [--json]` | Dump accessibility tree |
 | `ax-find` | `[--name N] [--role R] [--json]` | Find accessible nodes |
 | `ax-node` | `<selector> [--json]` | Show element accessibility info |
+| `file` | `<selector> <path\|->` | Upload file to file input |
+| `download` | `<selector> [file\|-]` | Download href/src target |
+
+## Agent Skill
+
+This repository includes a **rodney-browser** [agent skill](https://agentskills.io) that teaches AI coding agents how to automate browser interactions using rodney. The skill follows the open [Agent Skills standard](https://agentskills.io) and works with any compatible tool (Claude Code, Codex, etc.). When installed, your agent can open websites, fill forms, click buttons, take screenshots, run JavaScript, test web flows, and perform accessibility audits — all driven through rodney commands.
+
+### Global install (use across all projects)
+
+To make the skill available in every project, copy it from `skills/rodney-browser/` in this repo to your agent's global skills directory.
+
+**Claude Code:**
+
+```bash
+mkdir -p ~/.claude/skills
+cp -r skills/rodney-browser ~/.claude/skills/rodney-browser
+```
+
+Or as a one-liner from anywhere:
+
+```bash
+git clone https://github.com/simonw/rodney /tmp/rodney-skill && \
+  mkdir -p ~/.claude/skills && \
+  cp -r /tmp/rodney-skill/skills/rodney-browser ~/.claude/skills/rodney-browser && \
+  rm -rf /tmp/rodney-skill
+```
+
+**OpenAI Codex:**
+
+```bash
+mkdir -p ~/.agents/skills
+cp -r skills/rodney-browser ~/.agents/skills/rodney-browser
+```
+
+Or as a one-liner from anywhere:
+
+```bash
+git clone https://github.com/simonw/rodney /tmp/rodney-skill && \
+  mkdir -p ~/.agents/skills && \
+  cp -r /tmp/rodney-skill/skills/rodney-browser ~/.agents/skills/rodney-browser && \
+  rm -rf /tmp/rodney-skill
+```
+
+**Other agents:** Copy the `skills/rodney-browser/` directory to your agent's global skills path. Refer to your tool's documentation for the correct location.
+
+After installation, the skill is active in all sessions. Make sure the `rodney` binary is on your `PATH`.
+
+### What the skill enables
+
+Once installed, your AI coding agent will automatically use rodney when you ask it to:
+
+- **Browse websites** — "Open example.com and take a screenshot"
+- **Fill forms and interact** — "Log into the portal and search for X"
+- **Test web applications** — "Test the checkout flow end-to-end"
+- **Extract data** — "Scrape the product prices from this page"
+- **Accessibility audits** — "Check if all buttons have accessible names"
+- **Download files** — "Download the CSV export from the dashboard"
+
+The skill teaches the agent the screenshot-observe loop pattern, form filling, JS-based element discovery, click failure recovery, and multi-tab workflows.
