@@ -40,6 +40,10 @@ Screenshots:
   rodney screenshot [-w N] [-h N] [file]  Take page screenshot
   rodney screenshot-el <sel> [f]  Screenshot an element
 
+Video recording:
+  rodney start-video              Start recording video
+  rodney stop-video [file]        Stop and save (.gif default, .mp4 needs ffmpeg)
+
 Tabs:
   rodney pages                    List all pages/tabs
   rodney page <index>             Switch to page by index
