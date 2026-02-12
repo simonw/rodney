@@ -7,6 +7,7 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"os"
+	"reflect"
 	"strings"
 	"testing"
 	"time"
@@ -155,6 +156,39 @@ func navigateTo(t *testing.T, path string) *rod.Page {
 	page.MustWaitLoad()
 	t.Cleanup(func() { page.MustClose() })
 	return page
+}
+
+func TestParseChromeArgs_ParsesFlagsAndValues(t *testing.T) {
+	args, err := parseChromeArgs("disable-features=HttpsUpgrades --ignore-certificate-errors")
+	if err != nil {
+		t.Fatalf("parseChromeArgs returned error: %v", err)
+	}
+
+	want := []chromeArg{
+		{name: "disable-features", value: "HttpsUpgrades", hasValue: true},
+		{name: "ignore-certificate-errors", hasValue: false},
+	}
+
+	if !reflect.DeepEqual(args, want) {
+		t.Fatalf("unexpected parse result\nwant: %#v\ngot:  %#v", want, args)
+	}
+}
+
+func TestParseChromeArgs_HandlesEmptyInput(t *testing.T) {
+	args, err := parseChromeArgs("")
+	if err != nil {
+		t.Fatalf("parseChromeArgs returned error: %v", err)
+	}
+	if len(args) != 0 {
+		t.Fatalf("expected empty args, got: %#v", args)
+	}
+}
+
+func TestParseChromeArgs_RejectsInvalidFlag(t *testing.T) {
+	_, err := parseChromeArgs("--")
+	if err == nil {
+		t.Fatal("expected parseChromeArgs to fail for invalid flag")
+	}
 }
 
 // =====================

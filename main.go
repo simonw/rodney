@@ -20,6 +20,7 @@ import (
 
 	"github.com/go-rod/rod"
 	"github.com/go-rod/rod/lib/launcher"
+	"github.com/go-rod/rod/lib/launcher/flags"
 	"github.com/go-rod/rod/lib/proto"
 )
 
@@ -30,12 +31,12 @@ var version = "dev"
 
 // State persisted between CLI invocations
 type State struct {
-	DebugURL    string `json:"debug_url"`
-	ChromePID   int    `json:"chrome_pid"`
-	ActivePage  int    `json:"active_page"`  // index into pages list
-	DataDir     string `json:"data_dir"`
-	ProxyPID    int    `json:"proxy_pid,omitempty"`  // PID of auth proxy helper
-	ProxyPort   int    `json:"proxy_port,omitempty"` // local port of auth proxy
+	DebugURL   string `json:"debug_url"`
+	ChromePID  int    `json:"chrome_pid"`
+	ActivePage int    `json:"active_page"` // index into pages list
+	DataDir    string `json:"data_dir"`
+	ProxyPID   int    `json:"proxy_pid,omitempty"`  // PID of auth proxy helper
+	ProxyPort  int    `json:"proxy_port,omitempty"` // local port of auth proxy
 }
 
 func stateDir() string {
@@ -226,6 +227,55 @@ func init() {
 	}
 }
 
+type chromeArg struct {
+	name     string
+	value    string
+	hasValue bool
+}
+
+func parseChromeArgs(raw string) ([]chromeArg, error) {
+	fields := strings.Fields(raw)
+	parsed := make([]chromeArg, 0, len(fields))
+
+	for _, field := range fields {
+		arg := strings.TrimLeft(field, "-")
+		if arg == "" {
+			return nil, fmt.Errorf("invalid flag %q", field)
+		}
+
+		parts := strings.SplitN(arg, "=", 2)
+		if parts[0] == "" {
+			return nil, fmt.Errorf("missing flag name in %q", field)
+		}
+
+		entry := chromeArg{name: parts[0]}
+		if len(parts) == 2 {
+			entry.value = parts[1]
+			entry.hasValue = true
+		}
+		parsed = append(parsed, entry)
+	}
+
+	return parsed, nil
+}
+
+func applyChromeArgs(l *launcher.Launcher, raw string) error {
+	args, err := parseChromeArgs(raw)
+	if err != nil {
+		return err
+	}
+
+	for _, arg := range args {
+		if arg.hasValue {
+			l.Set(flags.Flag(arg.name), arg.value)
+			continue
+		}
+		l.Set(flags.Flag(arg.name))
+	}
+
+	return nil
+}
+
 // withPage loads state, connects, and returns the active page.
 // Caller should NOT close the browser (we just disconnect).
 func withPage() (*State, *rod.Browser, *rod.Page) {
@@ -272,6 +322,12 @@ func cmdStart(args []string) {
 
 	if bin := os.Getenv("ROD_CHROME_BIN"); bin != "" {
 		l = l.Bin(bin)
+	}
+
+	if chromeArgs := os.Getenv("ROD_CHROME_ARGS"); chromeArgs != "" {
+		if err := applyChromeArgs(l, chromeArgs); err != nil {
+			fatal("invalid ROD_CHROME_ARGS: %v", err)
+		}
 	}
 
 	// Detect authenticated proxy and launch helper if needed
@@ -1348,7 +1404,7 @@ func queryAXNodes(page *rod.Page, name, role string) ([]*proto.AccessibilityAXNo
 	}
 
 	result, err := proto.AccessibilityQueryAXTree{
-		BackendNodeID: doc.Root.BackendNodeID,
+		BackendNodeID:  doc.Root.BackendNodeID,
 		AccessibleName: name,
 		Role:           role,
 	}.Call(page)

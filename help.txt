@@ -61,3 +61,8 @@ Accessibility:
 Options:
   --version                       Print version and exit
   --help, -h, help                Show this help message
+
+Environment:
+  ROD_CHROME_BIN                  Path to Chrome/Chromium binary
+  ROD_CHROME_ARGS                 Extra Chrome flags (space-separated)
+  ROD_TIMEOUT                     Default element query timeout in seconds
