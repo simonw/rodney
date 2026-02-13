@@ -87,10 +87,12 @@ type State struct {
 }
 
 func stateDir() string {
+	if dir := os.Getenv("RODNEY_HOME"); dir != "" {
+		return dir
+	}
 	if activeStateDir != "" {
 		return activeStateDir
 	}
-	// Fallback for when activeStateDir hasn't been set (e.g. tests)
 	home, _ := os.UserHomeDir()
 	return filepath.Join(home, ".rodney")
 }

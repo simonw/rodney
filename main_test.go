@@ -729,6 +729,29 @@ func TestResolveStateDir_LocalUsesWorkingDir(t *testing.T) {
 	}
 }
 
+// =====================
+// RODNEY_HOME env var tests
+// =====================
+
+func TestStateDir_Default(t *testing.T) {
+	t.Setenv("RODNEY_HOME", "")
+	home, _ := os.UserHomeDir()
+	want := home + "/.rodney"
+	got := stateDir()
+	if got != want {
+		t.Errorf("stateDir() = %q, want %q", got, want)
+	}
+}
+
+func TestStateDir_EnvVar(t *testing.T) {
+	dir := t.TempDir()
+	t.Setenv("RODNEY_HOME", dir)
+	got := stateDir()
+	if got != dir {
+		t.Errorf("stateDir() = %q, want %q", got, dir)
+	}
+}
+
 func TestMimeToExt(t *testing.T) {
 	tests := []struct {
 		mime string

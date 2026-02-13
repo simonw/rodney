@@ -309,11 +309,12 @@ This pattern is useful in CI — run Rodney as a post-deploy check, an accessibi
 
 | Environment Variable | Default | Description |
 |---|---|---|
+| `RODNEY_HOME` | `~/.rodney` | Data directory for state and Chrome profile |
 | `ROD_CHROME_BIN` | `/usr/bin/google-chrome` | Path to Chrome/Chromium binary |
 | `ROD_TIMEOUT` | `30` | Default timeout in seconds for element queries |
 | `HTTPS_PROXY` / `HTTP_PROXY` | (none) | Authenticated proxy auto-detected on start |
 
-Global state is stored in `~/.rodney/state.json` with Chrome user data in `~/.rodney/chrome-data/`. When using `--local`, state is stored in `./.rodney/state.json` and `./.rodney/chrome-data/` in the current directory instead.
+Global state is stored in `~/.rodney/state.json` with Chrome user data in `~/.rodney/chrome-data/`. When using `--local`, state is stored in `./.rodney/state.json` and `./.rodney/chrome-data/` in the current directory instead. Set `RODNEY_HOME` to override the default global directory.
 
 ## Proxy support
 

@@ -70,6 +70,9 @@ By default, commands auto-detect: if ./.rodney/state.json exists in the
 current directory, the local session is used; otherwise the global session.
 Use "rodney start --local" to create a directory-scoped session.
 
+Environment:
+  RODNEY_HOME                     Override data directory (default: ~/.rodney)
+
 Exit codes:
   0  Success
   1  Check failed (exists, visible, ax-find returned no match)
