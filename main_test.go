@@ -4,6 +4,8 @@ import (
 	"encoding/base64"
 	"encoding/json"
 	"fmt"
+	"io"
+	"log"
 	"net/http"
 	"net/http/httptest"
 	"os"
@@ -655,7 +657,10 @@ func TestInsecureFlag_WithSelfSignedCert(t *testing.T) {
 <html><head><title>Secure Test</title></head>
 <body><h1>HTTPS Test Page</h1></body></html>`))
 	})
-	httpsServer := httptest.NewTLSServer(mux)
+	httpsServer := httptest.NewUnstartedServer(mux)
+	// Suppress expected TLS handshake errors to keep test output clean
+	httpsServer.Config.ErrorLog = log.New(io.Discard, "", 0)
+	httpsServer.StartTLS()
 	defer httpsServer.Close()
 
 	// Test 1: Browser WITHOUT --ignore-certificate-errors should fail
