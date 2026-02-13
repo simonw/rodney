@@ -249,6 +249,16 @@ func withPage() (*State, *rod.Browser, *rod.Page) {
 // --- Commands ---
 
 func cmdStart(args []string) {
+	ignoreCertErrors := false
+	for i := 0; i < len(args); i++ {
+		switch args[i] {
+		case "--insecure", "-k":
+			ignoreCertErrors = true
+		default:
+			fatal("unknown flag: %s\nusage: rodney start [--insecure]", args[i])
+		}
+	}
+
 	// Check if already running
 	if s, err := loadState(); err == nil {
 		// Try connecting
@@ -303,8 +313,12 @@ func cmdStart(args []string) {
 		time.Sleep(500 * time.Millisecond)
 
 		l.Set("proxy-server", fmt.Sprintf("http://127.0.0.1:%d", proxyPort))
-		l.Set("ignore-certificate-errors")
+		ignoreCertErrors = true // Proxy requires ignoring cert errors
 		fmt.Printf("Auth proxy started (PID %d, port %d) -> %s\n", proxyPID, proxyPort, server)
+	}
+
+	if ignoreCertErrors {
+		l.Set("ignore-certificate-errors")
 	}
 
 	debugURL := l.MustLaunch()

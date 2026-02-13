@@ -645,3 +645,75 @@ func TestMimeToExt(t *testing.T) {
 		}
 	}
 }
+
+func TestInsecureFlag_WithSelfSignedCert(t *testing.T) {
+	// Create HTTPS server with self-signed certificate
+	mux := http.NewServeMux()
+	mux.HandleFunc("/", func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "text/html")
+		w.Write([]byte(`<!DOCTYPE html>
+<html><head><title>Secure Test</title></head>
+<body><h1>HTTPS Test Page</h1></body></html>`))
+	})
+	httpsServer := httptest.NewTLSServer(mux)
+	defer httpsServer.Close()
+
+	// Test 1: Browser WITHOUT --ignore-certificate-errors should fail
+	t.Run("WithoutInsecureFlag", func(t *testing.T) {
+		l := launcher.New().
+			Set("no-sandbox").
+			Set("disable-gpu").
+			Set("single-process").
+			Headless(true).
+			Leakless(false)
+
+		if bin := os.Getenv("ROD_CHROME_BIN"); bin != "" {
+			l = l.Bin(bin)
+		}
+
+		u := l.MustLaunch()
+		browser := rod.New().ControlURL(u).MustConnect()
+		defer browser.MustClose()
+
+		page := browser.MustPage("")
+		defer page.MustClose()
+
+		err := page.Navigate(httpsServer.URL)
+		if err == nil {
+			t.Fatal("expected ERR_CERT_AUTHORITY_INVALID error, but navigation succeeded")
+		}
+		if !strings.Contains(err.Error(), "ERR_CERT_AUTHORITY_INVALID") {
+			t.Errorf("expected ERR_CERT_AUTHORITY_INVALID, got: %v", err)
+		}
+	})
+
+	// Test 2: Browser WITH --ignore-certificate-errors should succeed
+	t.Run("WithInsecureFlag", func(t *testing.T) {
+		l := launcher.New().
+			Set("no-sandbox").
+			Set("disable-gpu").
+			Set("single-process").
+			Set("ignore-certificate-errors"). // This is what --insecure sets
+			Headless(true).
+			Leakless(false)
+
+		if bin := os.Getenv("ROD_CHROME_BIN"); bin != "" {
+			l = l.Bin(bin)
+		}
+
+		u := l.MustLaunch()
+		browser := rod.New().ControlURL(u).MustConnect()
+		defer browser.MustClose()
+
+		// Try to navigate to HTTPS server with invalid cert
+		page := browser.MustPage(httpsServer.URL)
+		defer page.MustClose()
+
+		page.MustWaitLoad()
+		title := page.MustInfo().Title
+
+		if title != "Secure Test" {
+			t.Errorf("expected page to load successfully with title 'Secure Test', got %q", title)
+		}
+	})
+}
