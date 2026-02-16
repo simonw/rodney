@@ -259,6 +259,14 @@ func cmdStart(args []string) {
 		}
 	}
 
+	// Parse flags
+	headless := true
+	for _, arg := range args {
+		if arg == "--show" {
+			headless = false
+		}
+	}
+
 	dataDir := filepath.Join(stateDir(), "chrome-data")
 	os.MkdirAll(dataDir, 0755)
 
@@ -266,9 +274,15 @@ func cmdStart(args []string) {
 		Set("no-sandbox").
 		Set("disable-gpu").
 		Set("single-process"). // Required for screenshots in gVisor/container environments
-		Headless(true).
-		Leakless(false). // Keep Chrome alive after CLI exits
-		UserDataDir(dataDir)
+		Leakless(false).        // Keep Chrome alive after CLI exits
+		UserDataDir(dataDir).
+		Headless(headless)
+
+	// When in non-headless mode, make sure that we show the startup window immediately
+	// (instead of showing a window only after calling "rodney open")
+	if !headless {
+		l = l.Delete("no-startup-window")
+	}
 
 	if bin := os.Getenv("ROD_CHROME_BIN"); bin != "" {
 		l = l.Bin(bin)

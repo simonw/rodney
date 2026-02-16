@@ -1,7 +1,7 @@
 rodney - Chrome automation from the command line
 
 Browser lifecycle:
-  rodney start                    Launch headless Chrome
+  rodney start [--show]           Launch Chrome (headless by default, --show for visible)
   rodney stop                     Shut down Chrome
   rodney status                   Show browser status
 
