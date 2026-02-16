@@ -2,7 +2,8 @@ rodney - Chrome automation from the command line
 
 Browser lifecycle:
   rodney start                    Launch headless Chrome
-  rodney stop                     Shut down Chrome
+  rodney connect <host:port>      Connect to existing Chrome on remote debug port
+  rodney stop                     Shut down Chrome (or disconnect if connected)
   rodney status                   Show browser status
 
 Navigation:

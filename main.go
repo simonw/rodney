@@ -127,6 +127,8 @@ func main() {
 		cmdInternalProxy(args) // hidden: runs the auth proxy helper
 	case "start":
 		cmdStart(args)
+	case "connect":
+		cmdConnect(args)
 	case "stop":
 		cmdStop(args)
 	case "status":
@@ -329,6 +331,52 @@ func cmdStart(args []string) {
 	fmt.Printf("Debug URL: %s\n", debugURL)
 }
 
+func cmdConnect(args []string) {
+	if len(args) < 1 {
+		fatal("usage: rodney connect <host:port>")
+	}
+	hostport := args[0]
+	if _, _, err := net.SplitHostPort(hostport); err != nil {
+		fatal("argument must be host:port (e.g. localhost:9222): %s", hostport)
+	}
+
+	// Fetch the WebSocket debugger URL from Chrome's /json/version endpoint
+	resp, err := http.Get("http://" + hostport + "/json/version")
+	if err != nil {
+		fatal("could not reach browser at %s: %v", hostport, err)
+	}
+	defer resp.Body.Close()
+	body, err := io.ReadAll(resp.Body)
+	if err != nil {
+		fatal("failed to read response: %v", err)
+	}
+	var info struct {
+		WebSocketDebuggerURL string `json:"webSocketDebuggerUrl"`
+	}
+	if err := json.Unmarshal(body, &info); err != nil || info.WebSocketDebuggerURL == "" {
+		fatal("unexpected response from browser at %s", hostport)
+	}
+
+	// Verify the connection works
+	browser := rod.New().ControlURL(info.WebSocketDebuggerURL)
+	if err := browser.Connect(); err != nil {
+		fatal("could not connect to browser: %v", err)
+	}
+
+	// ChromePID=0 signals that we don't own this browser (stop won't kill it)
+	state := &State{
+		DebugURL:   info.WebSocketDebuggerURL,
+		ChromePID:  0,
+		ActivePage: 0,
+	}
+	if err := saveState(state); err != nil {
+		fatal("failed to save state: %v", err)
+	}
+
+	fmt.Printf("Connected to browser at %s\n", hostport)
+	fmt.Printf("Debug URL: %s\n", info.WebSocketDebuggerURL)
+}
+
 func cmdStop(args []string) {
 	s, err := loadState()
 	if err != nil {
@@ -336,16 +384,18 @@ func cmdStop(args []string) {
 	}
 	browser, err := connectBrowser(s)
 	if err != nil {
-		// Try to kill by PID
+		// Try to kill by PID only if we launched the browser
 		if s.ChromePID > 0 {
 			proc, err := os.FindProcess(s.ChromePID)
 			if err == nil {
 				proc.Signal(syscall.SIGTERM)
 			}
 		}
-	} else {
+	} else if s.ChromePID > 0 {
+		// Only close (and kill) the browser if we launched it
 		browser.MustClose()
 	}
+	// If ChromePID==0 we connected to an external browser; just clear state without closing it
 	// Also kill the proxy helper if running
 	if s.ProxyPID > 0 {
 		if proc, err := os.FindProcess(s.ProxyPID); err == nil {
