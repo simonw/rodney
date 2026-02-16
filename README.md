@@ -25,6 +25,14 @@ Each CLI invocation is a short-lived process. Chrome runs independently and tabs
 
 ## Building
 
+If you prefer not to build from source, you can run Rodney directly from PyPI using `uvx`:
+
+```bash
+uvx rodney
+```
+
+Then build from source if you want a local development binary:
+
 ```bash
 go build -o rodney .
 ```
