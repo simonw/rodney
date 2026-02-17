@@ -1,7 +1,8 @@
 rodney - Chrome automation from the command line
 
 Browser lifecycle:
-  rodney start [--insecure | -k]  Launch headless Chrome
+  rodney start [--show] [--insecure | -k]  Launch Chrome (headless by default, --show for visible)
+  rodney connect <host:port>      Connect to existing Chrome on remote debug port
   rodney stop                     Shut down Chrome
   rodney status                   Show browser status
 
@@ -9,7 +10,8 @@ Navigation:
   rodney open <url>               Navigate to URL
   rodney back                     Go back in history
   rodney forward                  Go forward in history
-  rodney reload                   Reload current page
+  rodney reload [--hard]          Reload page (--hard bypasses cache)
+  rodney clear-cache              Clear the browser cache
 
 Page info:
   rodney url                      Print current URL
@@ -48,10 +50,10 @@ Tabs:
   rodney newpage [url]            Open a new page/tab
   rodney closepage [index]        Close a page/tab
 
-Element queries:
-  rodney exists <selector>        Check if element exists (exit 0/1)
+Element checks:
+  rodney exists <selector>        Check if element exists (exit 1 if not)
   rodney count <selector>         Count matching elements
-  rodney visible <selector>       Check if element is visible (exit 0/1)
+  rodney visible <selector>       Check if element is visible (exit 1 if not)
 
 Accessibility:
   rodney ax-tree [--depth N] [--json]       Dump accessibility tree
@@ -59,5 +61,19 @@ Accessibility:
   rodney ax-node <selector> [--json]        Show accessibility info for element
 
 Options:
+  --local                         Use directory-scoped session (./.rodney/)
+  --global                        Use global session (~/.rodney/)
   --version                       Print version and exit
   --help, -h, help                Show this help message
+
+By default, commands auto-detect: if ./.rodney/state.json exists in the
+current directory, the local session is used; otherwise the global session.
+Use "rodney start --local" to create a directory-scoped session.
+
+Environment:
+  RODNEY_HOME                     Override data directory (default: ~/.rodney)
+
+Exit codes:
+  0  Success
+  1  Check failed (exists, visible, ax-find returned no match)
+  2  Error (bad arguments, no browser, timeout, etc.)

@@ -71,6 +71,12 @@ assert_eq "$OUT" "Test Page" "title returns page title"
 OUT=$($CLI reload 2>&1)
 assert_eq "$OUT" "Reloaded" "reload works"
 
+OUT=$($CLI reload --hard 2>&1)
+assert_eq "$OUT" "Reloaded" "reload --hard works"
+
+OUT=$($CLI clear-cache 2>&1)
+assert_eq "$OUT" "Browser cache cleared" "clear-cache works"
+
 # --- Element queries ---
 echo "[Element queries]"
 
