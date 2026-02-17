@@ -4,9 +4,12 @@ import (
 	"encoding/base64"
 	"encoding/json"
 	"fmt"
+	"io"
+	"log"
 	"net/http"
 	"net/http/httptest"
 	"os"
+	"path/filepath"
 	"reflect"
 	"strings"
 	"testing"
@@ -661,6 +664,130 @@ func TestDownload_ImgSrc(t *testing.T) {
 	}
 }
 
+// =====================
+// Directory-scoped sessions tests
+// =====================
+
+func TestExtractScopeArgs_NoFlags(t *testing.T) {
+	mode, remaining := extractScopeArgs([]string{"open", "https://example.com"})
+	if mode != scopeAuto {
+		t.Errorf("expected scopeAuto, got %v", mode)
+	}
+	if len(remaining) != 2 || remaining[0] != "open" || remaining[1] != "https://example.com" {
+		t.Errorf("expected [open https://example.com], got %v", remaining)
+	}
+}
+
+func TestExtractScopeArgs_LocalFlag(t *testing.T) {
+	mode, remaining := extractScopeArgs([]string{"--local", "start"})
+	if mode != scopeLocal {
+		t.Errorf("expected scopeLocal, got %v", mode)
+	}
+	if len(remaining) != 1 || remaining[0] != "start" {
+		t.Errorf("expected [start], got %v", remaining)
+	}
+}
+
+func TestExtractScopeArgs_GlobalFlag(t *testing.T) {
+	mode, remaining := extractScopeArgs([]string{"--global", "open", "https://example.com"})
+	if mode != scopeGlobal {
+		t.Errorf("expected scopeGlobal, got %v", mode)
+	}
+	if len(remaining) != 2 || remaining[0] != "open" || remaining[1] != "https://example.com" {
+		t.Errorf("expected [open https://example.com], got %v", remaining)
+	}
+}
+
+func TestExtractScopeArgs_LocalFlagAfterCommand(t *testing.T) {
+	mode, remaining := extractScopeArgs([]string{"open", "--local", "https://example.com"})
+	if mode != scopeLocal {
+		t.Errorf("expected scopeLocal, got %v", mode)
+	}
+	if len(remaining) != 2 || remaining[0] != "open" || remaining[1] != "https://example.com" {
+		t.Errorf("expected [open https://example.com], got %v", remaining)
+	}
+}
+
+func TestExtractScopeArgs_LastFlagWins(t *testing.T) {
+	mode, _ := extractScopeArgs([]string{"--local", "--global", "start"})
+	if mode != scopeGlobal {
+		t.Errorf("expected last flag (scopeGlobal) to win, got %v", mode)
+	}
+}
+
+func TestResolveStateDir_Global(t *testing.T) {
+	dir := resolveStateDir(scopeGlobal, "/some/working/dir")
+	home, _ := os.UserHomeDir()
+	expected := filepath.Join(home, ".rodney")
+	if dir != expected {
+		t.Errorf("expected %q, got %q", expected, dir)
+	}
+}
+
+func TestResolveStateDir_Local(t *testing.T) {
+	dir := resolveStateDir(scopeLocal, "/some/working/dir")
+	expected := filepath.Join("/some/working/dir", ".rodney")
+	if dir != expected {
+		t.Errorf("expected %q, got %q", expected, dir)
+	}
+}
+
+func TestResolveStateDir_AutoPrefersLocal(t *testing.T) {
+	// Create a temp directory with a .rodney/state.json to simulate local session
+	tmpDir := t.TempDir()
+	localRodney := filepath.Join(tmpDir, ".rodney")
+	os.MkdirAll(localRodney, 0755)
+	os.WriteFile(filepath.Join(localRodney, "state.json"), []byte(`{}`), 0644)
+
+	dir := resolveStateDir(scopeAuto, tmpDir)
+	if dir != localRodney {
+		t.Errorf("auto mode should prefer local when .rodney/state.json exists: expected %q, got %q", localRodney, dir)
+	}
+}
+
+func TestResolveStateDir_AutoFallsBackToGlobal(t *testing.T) {
+	// Use a temp directory with NO .rodney/ — should fall back to global
+	tmpDir := t.TempDir()
+	dir := resolveStateDir(scopeAuto, tmpDir)
+	home, _ := os.UserHomeDir()
+	expected := filepath.Join(home, ".rodney")
+	if dir != expected {
+		t.Errorf("auto mode should fall back to global: expected %q, got %q", expected, dir)
+	}
+}
+
+func TestResolveStateDir_LocalUsesWorkingDir(t *testing.T) {
+	tmpDir := t.TempDir()
+	dir := resolveStateDir(scopeLocal, tmpDir)
+	expected := filepath.Join(tmpDir, ".rodney")
+	if dir != expected {
+		t.Errorf("local mode should use working dir: expected %q, got %q", expected, dir)
+	}
+}
+
+// =====================
+// RODNEY_HOME env var tests
+// =====================
+
+func TestStateDir_Default(t *testing.T) {
+	t.Setenv("RODNEY_HOME", "")
+	home, _ := os.UserHomeDir()
+	want := home + "/.rodney"
+	got := stateDir()
+	if got != want {
+		t.Errorf("stateDir() = %q, want %q", got, want)
+	}
+}
+
+func TestStateDir_EnvVar(t *testing.T) {
+	dir := t.TempDir()
+	t.Setenv("RODNEY_HOME", dir)
+	got := stateDir()
+	if got != dir {
+		t.Errorf("stateDir() = %q, want %q", got, dir)
+	}
+}
+
 func TestMimeToExt(t *testing.T) {
 	tests := []struct {
 		mime string
@@ -678,4 +805,79 @@ func TestMimeToExt(t *testing.T) {
 			t.Errorf("mimeToExt(%q) = %q, want %q", tt.mime, got, tt.ext)
 		}
 	}
+}
+
+func TestInsecureFlag_WithSelfSignedCert(t *testing.T) {
+	// Create HTTPS server with self-signed certificate
+	mux := http.NewServeMux()
+	mux.HandleFunc("/", func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "text/html")
+		w.Write([]byte(`<!DOCTYPE html>
+<html><head><title>Secure Test</title></head>
+<body><h1>HTTPS Test Page</h1></body></html>`))
+	})
+	httpsServer := httptest.NewUnstartedServer(mux)
+	// Suppress expected TLS handshake errors to keep test output clean
+	httpsServer.Config.ErrorLog = log.New(io.Discard, "", 0)
+	httpsServer.StartTLS()
+	defer httpsServer.Close()
+
+	// Test 1: Browser WITHOUT --ignore-certificate-errors should fail
+	t.Run("WithoutInsecureFlag", func(t *testing.T) {
+		l := launcher.New().
+			Set("no-sandbox").
+			Set("disable-gpu").
+			Set("single-process").
+			Headless(true).
+			Leakless(false)
+
+		if bin := os.Getenv("ROD_CHROME_BIN"); bin != "" {
+			l = l.Bin(bin)
+		}
+
+		u := l.MustLaunch()
+		browser := rod.New().ControlURL(u).MustConnect()
+		defer browser.MustClose()
+
+		page := browser.MustPage("")
+		defer page.MustClose()
+
+		err := page.Navigate(httpsServer.URL)
+		if err == nil {
+			t.Fatal("expected ERR_CERT_AUTHORITY_INVALID error, but navigation succeeded")
+		}
+		if !strings.Contains(err.Error(), "ERR_CERT_AUTHORITY_INVALID") {
+			t.Errorf("expected ERR_CERT_AUTHORITY_INVALID, got: %v", err)
+		}
+	})
+
+	// Test 2: Browser WITH --ignore-certificate-errors should succeed
+	t.Run("WithInsecureFlag", func(t *testing.T) {
+		l := launcher.New().
+			Set("no-sandbox").
+			Set("disable-gpu").
+			Set("single-process").
+			Set("ignore-certificate-errors"). // This is what --insecure sets
+			Headless(true).
+			Leakless(false)
+
+		if bin := os.Getenv("ROD_CHROME_BIN"); bin != "" {
+			l = l.Bin(bin)
+		}
+
+		u := l.MustLaunch()
+		browser := rod.New().ControlURL(u).MustConnect()
+		defer browser.MustClose()
+
+		// Try to navigate to HTTPS server with invalid cert
+		page := browser.MustPage(httpsServer.URL)
+		defer page.MustClose()
+
+		page.MustWaitLoad()
+		title := page.MustInfo().Title
+
+		if title != "Secure Test" {
+			t.Errorf("expected page to load successfully with title 'Secure Test', got %q", title)
+		}
+	})
 }

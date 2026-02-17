@@ -6,7 +6,10 @@ on:
 
 jobs:
   test:
-    runs-on: ubuntu-latest
+    runs-on: ${{ matrix.os }}
+    strategy:
+      matrix:
+        os: [ubuntu-latest, macos-latest, windows-latest]
     steps:
       - uses: actions/checkout@v6
       - name: Set up Go
@@ -14,6 +17,6 @@ jobs:
         with:
           go-version: '1.24'
       - name: Build
-        run: go build -o rodney .
+        run: go build -o rodney${{ matrix.os == 'windows-latest' && '.exe' || '' }} .
       - name: Check version flag
-        run: ./rodney --version
+        run: ./rodney${{ matrix.os == 'windows-latest' && '.exe' || '' }} --version

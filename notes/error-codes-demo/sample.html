@@ -1,0 +1,25 @@
+<!DOCTYPE html>
+<html lang="en">
+<head><title>Checkout Page</title></head>
+<body>
+  <nav aria-label="Main navigation">
+    <a href="/products">Products</a>
+    <a href="/cart">Cart</a>
+  </nav>
+  <main>
+    <h1>Checkout</h1>
+    <form id="checkout-form">
+      <label for="email">Email</label>
+      <input id="email" type="email" required>
+      <label for="card">Card number</label>
+      <input id="card" type="text" required>
+      <button id="pay-btn" type="submit">Pay now</button>
+    </form>
+    <div id="spinner" style="display:none">Processing...</div>
+    <div id="error-banner" style="display:none" role="alert">Payment failed</div>
+  </main>
+  <footer>
+    <p>&copy; 2026 Demo Store</p>
+  </footer>
+</body>
+</html>

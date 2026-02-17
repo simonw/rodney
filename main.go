@@ -29,6 +29,54 @@ var helpText string
 
 var version = "dev"
 
+// scopeMode determines whether to use a local or global state directory.
+type scopeMode int
+
+const (
+	scopeAuto   scopeMode = iota // auto-detect: local if .rodney/state.json exists in cwd, else global
+	scopeLocal                   // force local (./.rodney/)
+	scopeGlobal                  // force global (~/.rodney/)
+)
+
+// activeStateDir is set once at startup based on --local/--global flags.
+var activeStateDir string
+
+// extractScopeArgs scans args for --local/--global, removes them, and returns the mode.
+// If both appear, the last one wins.
+func extractScopeArgs(args []string) (scopeMode, []string) {
+	mode := scopeAuto
+	var filtered []string
+	for _, arg := range args {
+		switch arg {
+		case "--local":
+			mode = scopeLocal
+		case "--global":
+			mode = scopeGlobal
+		default:
+			filtered = append(filtered, arg)
+		}
+	}
+	return mode, filtered
+}
+
+// resolveStateDir determines the state directory based on scope mode and working directory.
+func resolveStateDir(mode scopeMode, workingDir string) string {
+	switch mode {
+	case scopeLocal:
+		return filepath.Join(workingDir, ".rodney")
+	case scopeGlobal:
+		home, _ := os.UserHomeDir()
+		return filepath.Join(home, ".rodney")
+	default: // scopeAuto
+		localDir := filepath.Join(workingDir, ".rodney")
+		if _, err := os.Stat(filepath.Join(localDir, "state.json")); err == nil {
+			return localDir
+		}
+		home, _ := os.UserHomeDir()
+		return filepath.Join(home, ".rodney")
+	}
+}
+
 // State persisted between CLI invocations
 type State struct {
 	DebugURL   string `json:"debug_url"`
@@ -40,6 +88,12 @@ type State struct {
 }
 
 func stateDir() string {
+	if dir := os.Getenv("RODNEY_HOME"); dir != "" {
+		return dir
+	}
+	if activeStateDir != "" {
+		return activeStateDir
+	}
 	home, _ := os.UserHomeDir()
 	return filepath.Join(home, ".rodney")
 }
@@ -106,17 +160,27 @@ func printUsage() {
 
 func fatal(format string, args ...interface{}) {
 	fmt.Fprintf(os.Stderr, "error: "+format+"\n", args...)
-	os.Exit(1)
+	os.Exit(2)
 }
 
 func main() {
 	if len(os.Args) < 2 {
 		printUsage()
+		os.Exit(2)
+	}
+
+	// Extract --local/--global from all args before dispatching
+	mode, cleanedArgs := extractScopeArgs(os.Args[1:])
+	if len(cleanedArgs) == 0 {
+		printUsage()
 		os.Exit(1)
 	}
 
-	cmd := os.Args[1]
-	args := os.Args[2:]
+	wd, _ := os.Getwd()
+	activeStateDir = resolveStateDir(mode, wd)
+
+	cmd := cleanedArgs[0]
+	args := cleanedArgs[1:]
 
 	if cmd == "--version" {
 		fmt.Println(version)
@@ -128,6 +192,8 @@ func main() {
 		cmdInternalProxy(args) // hidden: runs the auth proxy helper
 	case "start":
 		cmdStart(args)
+	case "connect":
+		cmdConnect(args)
 	case "stop":
 		cmdStop(args)
 	case "status":
@@ -140,6 +206,8 @@ func main() {
 		cmdForward(args)
 	case "reload":
 		cmdReload(args)
+	case "clear-cache":
+		cmdClearCache(args)
 	case "url":
 		cmdURL(args)
 	case "title":
@@ -212,7 +280,7 @@ func main() {
 	default:
 		fmt.Fprintf(os.Stderr, "unknown command: %s\n", cmd)
 		printUsage()
-		os.Exit(1)
+		os.Exit(2)
 	}
 }
 
@@ -299,6 +367,16 @@ func withPage() (*State, *rod.Browser, *rod.Page) {
 // --- Commands ---
 
 func cmdStart(args []string) {
+	ignoreCertErrors := false
+	for i := 0; i < len(args); i++ {
+		switch args[i] {
+		case "--insecure", "-k":
+			ignoreCertErrors = true
+		default:
+			fatal("unknown flag: %s\nusage: rodney start [--insecure]", args[i])
+		}
+	}
+
 	// Check if already running
 	if s, err := loadState(); err == nil {
 		// Try connecting
@@ -309,6 +387,14 @@ func cmdStart(args []string) {
 		}
 	}
 
+	// Parse flags
+	headless := true
+	for _, arg := range args {
+		if arg == "--show" {
+			headless = false
+		}
+	}
+
 	dataDir := filepath.Join(stateDir(), "chrome-data")
 	os.MkdirAll(dataDir, 0755)
 
@@ -316,9 +402,15 @@ func cmdStart(args []string) {
 		Set("no-sandbox").
 		Set("disable-gpu").
 		Set("single-process"). // Required for screenshots in gVisor/container environments
-		Headless(true).
-		Leakless(false). // Keep Chrome alive after CLI exits
-		UserDataDir(dataDir)
+		Leakless(false).        // Keep Chrome alive after CLI exits
+		UserDataDir(dataDir).
+		Headless(headless)
+
+	// When in non-headless mode, make sure that we show the startup window immediately
+	// (instead of showing a window only after calling "rodney open")
+	if !headless {
+		l = l.Delete("no-startup-window")
+	}
 
 	if bin := os.Getenv("ROD_CHROME_BIN"); bin != "" {
 		l = l.Bin(bin)
@@ -347,7 +439,7 @@ func cmdStart(args []string) {
 		exe, _ := os.Executable()
 		cmd := exec.Command(exe, "_proxy",
 			strconv.Itoa(proxyPort), server, authHeader)
-		cmd.SysProcAttr = &syscall.SysProcAttr{Setsid: true}
+		setSysProcAttr(cmd)
 		if err := cmd.Start(); err != nil {
 			fatal("failed to start proxy helper: %v", err)
 		}
@@ -359,8 +451,12 @@ func cmdStart(args []string) {
 		time.Sleep(500 * time.Millisecond)
 
 		l.Set("proxy-server", fmt.Sprintf("http://127.0.0.1:%d", proxyPort))
-		l.Set("ignore-certificate-errors")
+		ignoreCertErrors = true // Proxy requires ignoring cert errors
 		fmt.Printf("Auth proxy started (PID %d, port %d) -> %s\n", proxyPID, proxyPort, server)
+	}
+
+	if ignoreCertErrors {
+		l.Set("ignore-certificate-errors")
 	}
 
 	debugURL := l.MustLaunch()
@@ -385,6 +481,52 @@ func cmdStart(args []string) {
 	fmt.Printf("Debug URL: %s\n", debugURL)
 }
 
+func cmdConnect(args []string) {
+	if len(args) < 1 {
+		fatal("usage: rodney connect <host:port>")
+	}
+	hostport := args[0]
+	if _, _, err := net.SplitHostPort(hostport); err != nil {
+		fatal("argument must be host:port (e.g. localhost:9222): %s", hostport)
+	}
+
+	// Fetch the WebSocket debugger URL from Chrome's /json/version endpoint
+	resp, err := http.Get("http://" + hostport + "/json/version")
+	if err != nil {
+		fatal("could not reach browser at %s: %v", hostport, err)
+	}
+	defer resp.Body.Close()
+	body, err := io.ReadAll(resp.Body)
+	if err != nil {
+		fatal("failed to read response: %v", err)
+	}
+	var info struct {
+		WebSocketDebuggerURL string `json:"webSocketDebuggerUrl"`
+	}
+	if err := json.Unmarshal(body, &info); err != nil || info.WebSocketDebuggerURL == "" {
+		fatal("unexpected response from browser at %s", hostport)
+	}
+
+	// Verify the connection works
+	browser := rod.New().ControlURL(info.WebSocketDebuggerURL)
+	if err := browser.Connect(); err != nil {
+		fatal("could not connect to browser: %v", err)
+	}
+
+	// ChromePID=0 signals that we don't own this browser (stop won't kill it)
+	state := &State{
+		DebugURL:   info.WebSocketDebuggerURL,
+		ChromePID:  0,
+		ActivePage: 0,
+	}
+	if err := saveState(state); err != nil {
+		fatal("failed to save state: %v", err)
+	}
+
+	fmt.Printf("Connected to browser at %s\n", hostport)
+	fmt.Printf("Debug URL: %s\n", info.WebSocketDebuggerURL)
+}
+
 func cmdStop(args []string) {
 	s, err := loadState()
 	if err != nil {
@@ -392,16 +534,18 @@ func cmdStop(args []string) {
 	}
 	browser, err := connectBrowser(s)
 	if err != nil {
-		// Try to kill by PID
+		// Try to kill by PID only if we launched the browser
 		if s.ChromePID > 0 {
 			proc, err := os.FindProcess(s.ChromePID)
 			if err == nil {
 				proc.Signal(syscall.SIGTERM)
 			}
 		}
-	} else {
+	} else if s.ChromePID > 0 {
+		// Only close (and kill) the browser if we launched it
 		browser.MustClose()
 	}
+	// If ChromePID==0 we connected to an external browser; just clear state without closing it
 	// Also kill the proxy helper if running
 	if s.ProxyPID > 0 {
 		if proc, err := os.FindProcess(s.ProxyPID); err == nil {
@@ -499,10 +643,33 @@ func cmdForward(args []string) {
 }
 
 func cmdReload(args []string) {
+	hard := false
+	for _, a := range args {
+		if a == "--hard" {
+			hard = true
+		}
+	}
 	_, _, page := withPage()
-	page.MustReload()
+	if hard {
+		// CDP Page.reload with ignoreCache (equivalent to Shift+Refresh)
+		err := (proto.PageReload{IgnoreCache: true}).Call(page)
+		if err != nil {
+			fatal("reload failed: %v", err)
+		}
+	} else {
+		page.MustReload()
+	}
 	page.MustWaitLoad()
 	fmt.Println("Reloaded")
+}
+
+func cmdClearCache(args []string) {
+	_, _, page := withPage()
+	err := (proto.NetworkClearBrowserCache{}).Call(page)
+	if err != nil {
+		fatal("clear cache failed: %v", err)
+	}
+	fmt.Println("Browser cache cleared")
 }
 
 func cmdURL(args []string) {
