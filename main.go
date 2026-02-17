@@ -373,7 +373,7 @@ func cmdStart(args []string) {
 		exe, _ := os.Executable()
 		cmd := exec.Command(exe, "_proxy",
 			strconv.Itoa(proxyPort), server, authHeader)
-		cmd.SysProcAttr = &syscall.SysProcAttr{Setsid: true}
+		setSysProcAttr(cmd)
 		if err := cmd.Start(); err != nil {
 			fatal("failed to start proxy helper: %v", err)
 		}
