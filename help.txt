@@ -40,6 +40,11 @@ Waiting:
   rodney waitidle                 Wait for network idle
   rodney sleep <seconds>          Sleep for N seconds
 
+Viewport:
+  rodney viewport                   Print current viewport size
+  rodney viewport <width> [height]  Set viewport size (triggers CSS media queries)
+  rodney viewport --reset           Reset to default viewport
+
 Screenshots:
   rodney screenshot [-w N] [-h N] [file]  Take page screenshot
   rodney screenshot-el <sel> [f]  Screenshot an element
