@@ -78,12 +78,14 @@ func resolveStateDir(mode scopeMode, workingDir string) string {
 
 // State persisted between CLI invocations
 type State struct {
-	DebugURL    string `json:"debug_url"`
-	ChromePID   int    `json:"chrome_pid"`
-	ActivePage  int    `json:"active_page"`  // index into pages list
-	DataDir     string `json:"data_dir"`
-	ProxyPID    int    `json:"proxy_pid,omitempty"`  // PID of auth proxy helper
-	ProxyPort   int    `json:"proxy_port,omitempty"` // local port of auth proxy
+	DebugURL      string `json:"debug_url"`
+	ChromePID     int    `json:"chrome_pid"`
+	ActivePage    int    `json:"active_page"`  // index into pages list
+	DataDir       string `json:"data_dir"`
+	ProxyPID      int    `json:"proxy_pid,omitempty"`  // PID of auth proxy helper
+	ProxyPort     int    `json:"proxy_port,omitempty"` // local port of auth proxy
+	ViewportWidth int    `json:"viewport_width,omitempty"`  // custom viewport width (0 = default)
+	ViewportHeight int   `json:"viewport_height,omitempty"` // custom viewport height (0 = default)
 }
 
 func stateDir() string {
@@ -249,6 +251,8 @@ func main() {
 		cmdWaitIdle(args)
 	case "sleep":
 		cmdSleep(args)
+	case "viewport":
+		cmdViewport(args)
 	case "screenshot":
 		cmdScreenshot(args)
 	case "screenshot-el":
@@ -313,6 +317,18 @@ func withPage() (*State, *rod.Browser, *rod.Page) {
 	}
 	// Apply default timeout so element queries don't hang forever
 	page = page.Timeout(defaultTimeout)
+	// Re-apply viewport override if set (CDP overrides are per-session)
+	if s.ViewportWidth > 0 {
+		h := s.ViewportHeight
+		if h == 0 {
+			h = 720
+		}
+		proto.EmulationSetDeviceMetricsOverride{
+			Width:             s.ViewportWidth,
+			Height:            h,
+			DeviceScaleFactor: 1,
+		}.Call(page)
+	}
 	return s, browser, page
 }
 
@@ -1101,9 +1117,62 @@ func nextAvailableFile(base, ext string) string {
 	}
 }
 
+func cmdViewport(args []string) {
+	s, _, page := withPage()
+
+	// No args: print current viewport size
+	if len(args) == 0 {
+		result, err := page.Eval(`() => window.innerWidth + "x" + window.innerHeight`)
+		if err != nil {
+			fatal("failed to read viewport: %v", err)
+		}
+		fmt.Println(result.Value.Str())
+		return
+	}
+
+	if args[0] == "--reset" {
+		err := proto.EmulationClearDeviceMetricsOverride{}.Call(page)
+		if err != nil {
+			fatal("failed to reset viewport: %v", err)
+		}
+		s.ViewportWidth = 0
+		s.ViewportHeight = 0
+		saveState(s)
+		fmt.Println("Viewport reset")
+		return
+	}
+
+	width, err := strconv.Atoi(args[0])
+	if err != nil {
+		fatal("invalid width: %v", err)
+	}
+
+	height := 720
+	if len(args) >= 2 {
+		height, err = strconv.Atoi(args[1])
+		if err != nil {
+			fatal("invalid height: %v", err)
+		}
+	}
+
+	err = proto.EmulationSetDeviceMetricsOverride{
+		Width:             width,
+		Height:            height,
+		DeviceScaleFactor: 1,
+	}.Call(page)
+	if err != nil {
+		fatal("failed to set viewport: %v", err)
+	}
+
+	s.ViewportWidth = width
+	s.ViewportHeight = height
+	saveState(s)
+	fmt.Printf("%dx%d\n", width, height)
+}
+
 func cmdScreenshot(args []string) {
 	var file string
-	width := 1280
+	width := 0  // 0 = use saved viewport or default 1280
 	height := 0
 	fullPage := true
 
@@ -1143,7 +1212,19 @@ func cmdScreenshot(args []string) {
 		file = nextAvailableFile("screenshot", ".png")
 	}
 
-	_, _, page := withPage()
+	s, _, page := withPage()
+
+	// Use saved viewport dimensions if no explicit -w/-h flags given
+	if width == 0 {
+		if s.ViewportWidth > 0 {
+			width = s.ViewportWidth
+		} else {
+			width = 1280
+		}
+	}
+	if height == 0 && s.ViewportHeight > 0 {
+		height = s.ViewportHeight
+	}
 
 	// Set viewport size
 	viewportHeight := height
