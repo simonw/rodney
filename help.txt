@@ -21,6 +21,9 @@ Page info:
   rodney attr <selector> <name>   Print attribute value
   rodney pdf [file]               Save page as PDF
 
+Console:
+  rodney logs [-f] [-n N] [--json]  Print console logs (default: snapshot, -f to stream)
+
 Interaction:
   rodney js <expression>          Evaluate JavaScript expression
   rodney click <selector>         Click an element

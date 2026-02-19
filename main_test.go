@@ -11,6 +11,7 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
@@ -51,6 +52,7 @@ func TestMain(m *testing.M) {
 	mux.HandleFunc("/download", handleDownload)
 	mux.HandleFunc("/testfile.txt", handleTestFile)
 	mux.HandleFunc("/empty", handleEmpty)
+	mux.HandleFunc("/logs", handleLogs)
 	server := httptest.NewServer(mux)
 
 	env = &testEnv{browser: browser, server: server}
@@ -147,6 +149,21 @@ func handleEmpty(w http.ResponseWriter, r *http.Request) {
 <html lang="en">
 <head><title>Empty Page</title></head>
 <body></body>
+</html>`))
+}
+
+func handleLogs(w http.ResponseWriter, r *http.Request) {
+	w.Header().Set("Content-Type", "text/html")
+	w.Write([]byte(`<!DOCTYPE html>
+<html lang="en">
+<head><title>Logs Test Page</title></head>
+<body>
+<script>
+  console.log("info message from logs test");
+  console.warn("warning message from logs test");
+  console.error("error message from logs test");
+</script>
+</body>
 </html>`))
 }
 
@@ -1147,4 +1164,168 @@ func TestInsecureFlag_WithSelfSignedCert(t *testing.T) {
 			t.Errorf("expected page to load successfully with title 'Secure Test', got %q", title)
 		}
 	})
+}
+
+// =====================
+// logs command tests
+// =====================
+
+// collectConsoleMsgs enables the Runtime domain, emits js, collects up to
+// maxCount events (or waits timeout), and returns the collected entries.
+// It does NOT use page.Context() wrapping to avoid event-routing issues.
+func collectConsoleMsgs(page *rod.Page, js string, maxCount int, timeout time.Duration) (texts []string, levels []string) {
+	var mu sync.Mutex
+	done := make(chan struct{})
+	var once sync.Once
+	closeDone := func() { once.Do(func() { close(done) }) }
+
+	wait := page.EachEvent(func(e *proto.RuntimeConsoleAPICalled) bool {
+		mu.Lock()
+		texts = append(texts, formatConsoleArgs(e.Args))
+		levels = append(levels, consoleTypeToLevel(e.Type))
+		n := len(texts)
+		mu.Unlock()
+		if n >= maxCount {
+			closeDone()
+			return true // stop
+		}
+		return false
+	})
+
+	(proto.RuntimeEnable{}).Call(page) //nolint
+	page.MustEval(js)
+
+	go func() {
+		wait()
+		closeDone()
+	}()
+
+	select {
+	case <-done:
+	case <-time.After(timeout):
+	}
+	return
+}
+
+func TestLogs_SnapshotCapture(t *testing.T) {
+	page := navigateTo(t, "/")
+
+	texts, _ := collectConsoleMsgs(page, `() => {
+		console.log("info message from logs test");
+		console.warn("warning message from logs test");
+		console.error("error message from logs test");
+	}`, 3, 3*time.Second)
+
+	if len(texts) < 3 {
+		t.Fatalf("expected at least 3 log entries, got %d: %v", len(texts), texts)
+	}
+
+	found := false
+	for _, text := range texts {
+		if strings.Contains(text, "info message from logs test") {
+			found = true
+			break
+		}
+	}
+	if !found {
+		t.Errorf("expected 'info message from logs test' in entries, got: %v", texts)
+	}
+}
+
+func TestLogs_ConsoleTypes(t *testing.T) {
+	page := navigateTo(t, "/")
+
+	_, levels := collectConsoleMsgs(page, `() => {
+		console.warn("warning entry for level test");
+		console.error("error entry for level test");
+	}`, 2, 3*time.Second)
+
+	levelSet := make(map[string]bool)
+	for _, l := range levels {
+		levelSet[l] = true
+	}
+
+	if !levelSet["warning"] {
+		t.Errorf("expected a warning-level entry, got levels: %v", levels)
+	}
+	if !levelSet["error"] {
+		t.Errorf("expected an error-level entry, got levels: %v", levels)
+	}
+}
+
+
+func TestLogs_FormatLogLevel(t *testing.T) {
+	tests := []struct {
+		level    proto.LogLogEntryLevel
+		expected string
+	}{
+		{proto.LogLogEntryLevelVerbose, "verbose"},
+		{proto.LogLogEntryLevelInfo, "info"},
+		{proto.LogLogEntryLevelWarning, "warning"},
+		{proto.LogLogEntryLevelError, "error"},
+		{proto.LogLogEntryLevel("custom"), "custom"},
+	}
+	for _, tt := range tests {
+		got := formatLogLevel(tt.level)
+		if got != tt.expected {
+			t.Errorf("formatLogLevel(%q) = %q, want %q", tt.level, got, tt.expected)
+		}
+	}
+}
+
+func TestLogs_ConsoleTypeToLevel(t *testing.T) {
+	tests := []struct {
+		ct       proto.RuntimeConsoleAPICalledType
+		expected string
+	}{
+		{proto.RuntimeConsoleAPICalledTypeDebug, "verbose"},
+		{proto.RuntimeConsoleAPICalledTypeLog, "info"},
+		{proto.RuntimeConsoleAPICalledTypeInfo, "info"},
+		{proto.RuntimeConsoleAPICalledTypeWarning, "warning"},
+		{proto.RuntimeConsoleAPICalledTypeError, "error"},
+		{proto.RuntimeConsoleAPICalledTypeAssert, "error"},
+		{proto.RuntimeConsoleAPICalledTypeDir, "info"},
+	}
+	for _, tt := range tests {
+		got := consoleTypeToLevel(tt.ct)
+		if got != tt.expected {
+			t.Errorf("consoleTypeToLevel(%q) = %q, want %q", tt.ct, got, tt.expected)
+		}
+	}
+}
+
+func TestLogs_ScanLogFile(t *testing.T) {
+	dir := t.TempDir()
+	logFile := filepath.Join(dir, "test.ndjson")
+
+	content := `{"level":"info","source":"javascript","text":"hello","timestamp":"2024-01-01T12:00:00.000Z"}
+{"level":"warning","source":"javascript","text":"world","timestamp":"2024-01-01T12:00:01.000Z"}
+`
+	if err := os.WriteFile(logFile, []byte(content), 0644); err != nil {
+		t.Fatalf("failed to write log file: %v", err)
+	}
+
+	var lines []string
+	scanLogFile(logFile, func(line string) { lines = append(lines, line) })
+	if len(lines) != 2 {
+		t.Fatalf("expected 2 lines, got %d: %v", len(lines), lines)
+	}
+
+	var obj struct {
+		Level string `json:"level"`
+		Text  string `json:"text"`
+	}
+	if err := json.Unmarshal([]byte(lines[0]), &obj); err != nil {
+		t.Fatalf("failed to unmarshal line 0: %v", err)
+	}
+	if obj.Level != "info" || obj.Text != "hello" {
+		t.Errorf("line 0: got level=%q text=%q, want level=%q text=%q", obj.Level, obj.Text, "info", "hello")
+	}
+
+	if err := json.Unmarshal([]byte(lines[1]), &obj); err != nil {
+		t.Fatalf("failed to unmarshal line 1: %v", err)
+	}
+	if obj.Level != "warning" || obj.Text != "world" {
+		t.Errorf("line 1: got level=%q text=%q, want level=%q text=%q", obj.Level, obj.Text, "warning", "world")
+	}
 }

@@ -73,6 +73,24 @@ rodney attr "a#link" href     # Print attribute value
 rodney pdf output.pdf         # Save page as PDF
 ```
 
+### Console logs
+
+```bash
+rodney logs                   # Print all buffered console logs and exit
+rodney logs -n 5              # Print last 5 buffered log entries
+rodney logs -f                # Print buffered logs, then stream new ones (Ctrl+C to stop)
+rodney logs -f -n 5           # Print last 5 buffered logs, then stream new ones
+rodney logs --json            # JSON output (one object per line)
+```
+
+Text output format: `[level] message` (e.g. `[error] Uncaught TypeError: ...`).
+
+JSON output format (one object per line):
+```json
+{"level":"info","source":"javascript","text":"Page initialized","timestamp":"2024-01-01T12:00:00.123Z"}
+{"level":"error","source":"javascript","text":"Uncaught TypeError: ...","timestamp":"2024-01-01T12:00:00.456Z","url":"https://example.com/app.js","line":42}
+```
+
 ### Run JavaScript
 
 ```bash

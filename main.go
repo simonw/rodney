@@ -2,6 +2,7 @@ package main
 
 import (
 	_ "embed"
+	"bufio"
 	"encoding/base64"
 	"encoding/json"
 	"fmt"
@@ -12,6 +13,7 @@ import (
 	"os"
 	"os/exec"
 	"os/signal"
+	"sync"
 	"path/filepath"
 	"strconv"
 	"strings"
@@ -82,8 +84,10 @@ type State struct {
 	ChromePID   int    `json:"chrome_pid"`
 	ActivePage  int    `json:"active_page"`  // index into pages list
 	DataDir     string `json:"data_dir"`
-	ProxyPID    int    `json:"proxy_pid,omitempty"`  // PID of auth proxy helper
-	ProxyPort   int    `json:"proxy_port,omitempty"` // local port of auth proxy
+	ProxyPID    int    `json:"proxy_pid,omitempty"`   // PID of auth proxy helper
+	ProxyPort   int    `json:"proxy_port,omitempty"`  // local port of auth proxy
+	Logs        bool   `json:"logs,omitempty"`        // console log capture enabled
+	LoggerPID   int    `json:"logger_pid,omitempty"`  // PID of _logger subprocess
 }
 
 func stateDir() string {
@@ -189,6 +193,8 @@ func main() {
 	switch cmd {
 	case "_proxy":
 		cmdInternalProxy(args) // hidden: runs the auth proxy helper
+	case "_logger":
+		cmdInternalLogger(args) // hidden: runs the browser console logger
 	case "start":
 		cmdStart(args)
 	case "connect":
@@ -269,6 +275,8 @@ func main() {
 		cmdVisible(args)
 	case "assert":
 		cmdAssert(args)
+	case "logs":
+		cmdLogs(args)
 	case "ax-tree":
 		cmdAXTree(args)
 	case "ax-find":
@@ -320,12 +328,15 @@ func withPage() (*State, *rod.Browser, *rod.Page) {
 
 func cmdStart(args []string) {
 	ignoreCertErrors := false
+	enableLogs := false
 	for i := 0; i < len(args); i++ {
 		switch args[i] {
 		case "--insecure", "-k":
 			ignoreCertErrors = true
+		case "--logs":
+			enableLogs = true
 		default:
-			fatal("unknown flag: %s\nusage: rodney start [--insecure]", args[i])
+			fatal("unknown flag: %s\nusage: rodney start [--insecure] [--logs]", args[i])
 		}
 	}
 
@@ -410,6 +421,22 @@ func cmdStart(args []string) {
 	// Get Chrome PID from the launcher
 	pid := l.PID()
 
+	// Launch logger subprocess if --logs was specified
+	var loggerPID int
+	if enableLogs {
+		logsDir := filepath.Join(stateDir(), "logs")
+		os.MkdirAll(logsDir, 0755)
+		exe, _ := os.Executable()
+		cmd := exec.Command(exe, "_logger", debugURL, logsDir)
+		setSysProcAttr(cmd)
+		if err := cmd.Start(); err != nil {
+			fatal("failed to start logger: %v", err)
+		}
+		loggerPID = cmd.Process.Pid
+		cmd.Process.Release()
+		fmt.Printf("Logger started (PID %d)\n", loggerPID)
+	}
+
 	state := &State{
 		DebugURL:   debugURL,
 		ChromePID:  pid,
@@ -417,6 +444,8 @@ func cmdStart(args []string) {
 		DataDir:    dataDir,
 		ProxyPID:   proxyPID,
 		ProxyPort:  proxyPort,
+		Logs:       enableLogs,
+		LoggerPID:  loggerPID,
 	}
 
 	if err := saveState(state); err != nil {
@@ -498,6 +527,12 @@ func cmdStop(args []string) {
 			proc.Signal(syscall.SIGTERM)
 		}
 	}
+	// Kill the logger subprocess if running
+	if s.LoggerPID > 0 {
+		if proc, err := os.FindProcess(s.LoggerPID); err == nil {
+			proc.Signal(syscall.SIGTERM)
+		}
+	}
 	removeState()
 	fmt.Println("Chrome stopped")
 }
@@ -549,7 +584,20 @@ func cmdOpen(args []string) {
 	pages, _ := browser.Pages()
 	var page *rod.Page
 	if len(pages) == 0 {
-		page = browser.MustPage(url)
+		if s.Logs {
+			// Create a blank page first so _logger receives TargetTargetCreated and
+			// calls RuntimeEnable before any scripts execute. RuntimeEnable persists
+			// across same-target navigations, so inline scripts on the real URL are
+			// captured. Poll for the log file: trackPage creates it only after
+			// RuntimeEnable returns, so its existence is an exact ready signal.
+			page = browser.MustPage("")
+			waitForLogger(page)
+			if err := page.Navigate(url); err != nil {
+				fatal("navigation failed: %v", err)
+			}
+		} else {
+			page = browser.MustPage(url)
+		}
 		s.ActivePage = 0
 		saveState(s)
 	} else {
@@ -724,6 +772,7 @@ func cmdJS(args []string) {
 	// Wrap bare expressions in a function
 	js := fmt.Sprintf(`() => { return (%s); }`, expr)
 	result, err := page.Eval(js)
+
 	if err != nil {
 		fatal("JS error: %v", err)
 	}
@@ -1272,7 +1321,16 @@ func cmdNewPage(args []string) {
 
 	var page *rod.Page
 	if url != "" {
-		page = browser.MustPage(url)
+		if s.Logs {
+			// Same blank-page-first strategy as cmdOpen.
+			page = browser.MustPage("")
+			waitForLogger(page)
+			if err := page.Navigate(url); err != nil {
+				fatal("navigation failed: %v", err)
+			}
+		} else {
+			page = browser.MustPage(url)
+		}
 		page.MustWaitLoad()
 	} else {
 		page = browser.MustPage("")
@@ -1492,6 +1550,316 @@ func cmdAssert(args []string) {
 func init() {
 	signal.Ignore(syscall.SIGPIPE)
 }
+
+// --- Console log commands ---
+
+// consoleEntry holds a normalized console log entry.
+type consoleEntry struct {
+	level     string
+	source    string
+	text      string
+	timestamp float64 // Unix milliseconds
+	url       string
+	line      *int
+}
+
+// formatLogLevel formats a proto.LogLogEntryLevel value as a string.
+// Kept for compatibility and unit-testing.
+func formatLogLevel(level proto.LogLogEntryLevel) string {
+	switch level {
+	case proto.LogLogEntryLevelVerbose:
+		return "verbose"
+	case proto.LogLogEntryLevelInfo:
+		return "info"
+	case proto.LogLogEntryLevelWarning:
+		return "warning"
+	case proto.LogLogEntryLevelError:
+		return "error"
+	default:
+		return string(level)
+	}
+}
+
+// consoleTypeToLevel maps a Runtime.consoleAPICalled type to a log level string.
+func consoleTypeToLevel(t proto.RuntimeConsoleAPICalledType) string {
+	switch t {
+	case proto.RuntimeConsoleAPICalledTypeDebug:
+		return "verbose"
+	case proto.RuntimeConsoleAPICalledTypeLog, proto.RuntimeConsoleAPICalledTypeInfo,
+		proto.RuntimeConsoleAPICalledTypeDir, proto.RuntimeConsoleAPICalledTypeDirxml,
+		proto.RuntimeConsoleAPICalledTypeTable, proto.RuntimeConsoleAPICalledTypeTrace,
+		proto.RuntimeConsoleAPICalledTypeStartGroup, proto.RuntimeConsoleAPICalledTypeStartGroupCollapsed,
+		proto.RuntimeConsoleAPICalledTypeEndGroup, proto.RuntimeConsoleAPICalledTypeClear,
+		proto.RuntimeConsoleAPICalledTypeCount, proto.RuntimeConsoleAPICalledTypeTimeEnd,
+		proto.RuntimeConsoleAPICalledTypeProfile, proto.RuntimeConsoleAPICalledTypeProfileEnd:
+		return "info"
+	case proto.RuntimeConsoleAPICalledTypeWarning:
+		return "warning"
+	case proto.RuntimeConsoleAPICalledTypeError, proto.RuntimeConsoleAPICalledTypeAssert:
+		return "error"
+	default:
+		return string(t)
+	}
+}
+
+// formatConsoleArgs converts Runtime RemoteObjects to a human-readable string.
+func formatConsoleArgs(args []*proto.RuntimeRemoteObject) string {
+	var parts []string
+	for _, arg := range args {
+		switch string(arg.Type) {
+		case "string":
+			parts = append(parts, arg.Value.Str())
+		case "number", "boolean":
+			parts = append(parts, arg.Value.JSON("", ""))
+		case "undefined":
+			parts = append(parts, "undefined")
+		case "null":
+			parts = append(parts, "null")
+		default:
+			if arg.Description != "" {
+				parts = append(parts, arg.Description)
+			} else {
+				parts = append(parts, arg.Value.JSON("", ""))
+			}
+		}
+	}
+	return strings.Join(parts, " ")
+}
+
+func printLogEntry(entry consoleEntry, jsonOutput bool) {
+	if jsonOutput {
+		ts := time.UnixMilli(int64(entry.timestamp)).UTC()
+		obj := map[string]interface{}{
+			"level":     entry.level,
+			"source":    entry.source,
+			"text":      entry.text,
+			"timestamp": ts.Format("2006-01-02T15:04:05.000Z07:00"),
+		}
+		if entry.url != "" {
+			obj["url"] = entry.url
+		}
+		if entry.line != nil {
+			obj["line"] = *entry.line
+		}
+		data, _ := json.Marshal(obj)
+		fmt.Println(string(data))
+	} else {
+		fmt.Printf("[%s] %s\n", entry.level, entry.text)
+	}
+}
+
+func cmdLogs(args []string) {
+	followMode := false
+	jsonOutput := false
+	limitN := -1
+
+	for i := 0; i < len(args); i++ {
+		switch args[i] {
+		case "-f", "--follow":
+			followMode = true
+		case "--json":
+			jsonOutput = true
+		case "-n":
+			i++
+			if i >= len(args) {
+				fatal("missing value for -n")
+			}
+			n, err := strconv.Atoi(args[i])
+			if err != nil || n < 1 {
+				fatal("invalid value for -n: %s", args[i])
+			}
+			limitN = n
+		default:
+			fatal("unknown flag: %s\nusage: rodney logs [-f] [-n N] [--json]", args[i])
+		}
+	}
+
+	s, err := loadState()
+	if err != nil {
+		fatal("%v", err)
+	}
+	if !s.Logs {
+		fmt.Fprintln(os.Stderr, "logs not enabled (run: rodney start --logs)")
+		os.Exit(1)
+	}
+	browser, err := connectBrowser(s)
+	if err != nil {
+		fatal("%v", err)
+	}
+	page, err := getActivePage(browser, s)
+	if err != nil {
+		fatal("%v", err)
+	}
+
+	logFile := filepath.Join(stateDir(), "logs", string(page.TargetID)+".ndjson")
+
+	if _, err := os.Stat(logFile); os.IsNotExist(err) {
+		fmt.Fprintln(os.Stderr, "no console log recorded for this page yet")
+		os.Exit(0)
+	}
+
+	if followMode {
+		fmt.Fprintln(os.Stderr, "Streaming console logs (Ctrl+C to stop)...")
+		tailLogFile(logFile, limitN, jsonOutput)
+		return
+	}
+
+	// Snapshot mode: stream the file to avoid loading it all into memory.
+	if limitN > 0 {
+		// Ring buffer: O(limitN) memory regardless of file size.
+		ring := make([]string, limitN)
+		count := 0
+		scanLogFile(logFile, func(line string) {
+			ring[count%limitN] = line
+			count++
+		})
+		start, n := 0, count
+		if count > limitN {
+			start = count % limitN
+			n = limitN
+		}
+		for i := 0; i < n; i++ {
+			printNDJSONLine(ring[(start+i)%limitN], jsonOutput)
+		}
+	} else {
+		scanLogFile(logFile, func(line string) {
+			printNDJSONLine(line, jsonOutput)
+		})
+	}
+}
+
+// scanLogFile opens logFile and calls fn for each non-empty line using a
+// streaming bufio.Scanner — no whole-file read into memory.
+func scanLogFile(logFile string, fn func(string)) {
+	f, err := os.Open(logFile)
+	if err != nil {
+		return
+	}
+	defer f.Close()
+	scanner := bufio.NewScanner(f)
+	for scanner.Scan() {
+		if line := scanner.Text(); line != "" {
+			fn(line)
+		}
+	}
+}
+
+// printNDJSONLine prints a single NDJSON log line.
+// In JSON mode it prints verbatim; otherwise it formats as "[level] text".
+func printNDJSONLine(line string, jsonOutput bool) {
+	if jsonOutput {
+		fmt.Println(line)
+		return
+	}
+	var obj struct {
+		Level string `json:"level"`
+		Text  string `json:"text"`
+	}
+	if err := json.Unmarshal([]byte(line), &obj); err == nil {
+		fmt.Printf("[%s] %s\n", obj.Level, obj.Text)
+	}
+}
+
+// tailLogFile follows a log file, printing new lines as they are appended.
+// If limitN > 0, prints the last N existing lines first, then follows new content.
+// If limitN <= 0, seeks to the end immediately and only shows new entries.
+func tailLogFile(logFile string, limitN int, jsonOutput bool) {
+	f, err := os.Open(logFile)
+	if err != nil {
+		fatal("failed to open log file: %v", err)
+	}
+	defer f.Close()
+
+	if limitN > 0 {
+		// Ring buffer: stream last N lines without loading the whole file.
+		ring := make([]string, limitN)
+		count := 0
+		scanner := bufio.NewScanner(f)
+		for scanner.Scan() {
+			if line := scanner.Text(); line != "" {
+				ring[count%limitN] = line
+				count++
+			}
+		}
+		start, n := 0, count
+		if count > limitN {
+			start = count % limitN
+			n = limitN
+		}
+		for i := 0; i < n; i++ {
+			printNDJSONLine(ring[(start+i)%limitN], jsonOutput)
+		}
+	}
+	// Seek to end to tail only new content (scanner may have over-read into
+	// a bufio buffer, but explicit SeekEnd corrects the OS file position).
+	f.Seek(0, io.SeekEnd)
+
+	sigCh := make(chan os.Signal, 1)
+	signal.Notify(sigCh, syscall.SIGINT, syscall.SIGTERM)
+
+	buf := make([]byte, 4096)
+	var partial string
+	for {
+		select {
+		case <-sigCh:
+			return
+		default:
+		}
+		n, _ := f.Read(buf)
+		if n > 0 {
+			partial += string(buf[:n])
+			for {
+				idx := strings.Index(partial, "\n")
+				if idx < 0 {
+					break
+				}
+				line := partial[:idx]
+				partial = partial[idx+1:]
+				if line != "" {
+					printNDJSONLine(line, jsonOutput)
+				}
+			}
+		} else {
+			time.Sleep(50 * time.Millisecond)
+		}
+	}
+}
+
+func makeConsoleEntry(e *proto.RuntimeConsoleAPICalled) consoleEntry {
+	entry := consoleEntry{
+		level:     consoleTypeToLevel(e.Type),
+		source:    "javascript",
+		text:      formatConsoleArgs(e.Args),
+		timestamp: float64(e.Timestamp),
+	}
+	if e.StackTrace != nil && len(e.StackTrace.CallFrames) > 0 {
+		frame := e.StackTrace.CallFrames[0]
+		entry.url = frame.URL
+		line := frame.LineNumber
+		entry.line = &line
+	}
+	return entry
+}
+
+// marshalConsoleEntry serializes a consoleEntry to a JSON line for the NDJSON log file.
+func marshalConsoleEntry(entry consoleEntry) string {
+	ts := time.UnixMilli(int64(entry.timestamp)).UTC()
+	obj := map[string]interface{}{
+		"level":     entry.level,
+		"source":    entry.source,
+		"text":      entry.text,
+		"timestamp": ts.Format("2006-01-02T15:04:05.000Z07:00"),
+	}
+	if entry.url != "" {
+		obj["url"] = entry.url
+	}
+	if entry.line != nil {
+		obj["line"] = *entry.line
+	}
+	data, _ := json.Marshal(obj)
+	return string(data)
+}
+
 
 // --- Accessibility commands ---
 
@@ -1832,6 +2200,119 @@ func formatAXNodeDetailJSON(node *proto.AccessibilityAXNode) string {
 		return "{}"
 	}
 	return string(data)
+}
+
+// --- Console logger infrastructure ---
+
+// cmdInternalLogger is a hidden subcommand: rodney _logger <debugURL> <logsDir>
+// It connects to the running Chrome instance, enables target discovery, and
+// immediately subscribes to console events on each page as it is created.
+func cmdInternalLogger(args []string) {
+	if len(args) < 2 {
+		fatal("usage: rodney _logger <debugURL> <logsDir>")
+	}
+	debugURL := args[0]
+	logsDir := args[1]
+
+	browser := rod.New().ControlURL(debugURL).MustConnect()
+	os.MkdirAll(logsDir, 0755)
+
+	var mu sync.Mutex
+	tracking := map[proto.TargetTargetID]bool{}
+
+	// subscribeToPage marks the target as tracked and starts trackPage in a
+	// goroutine. It looks up the *rod.Page by target ID; retries briefly in
+	// case GetTargets lags slightly behind the TargetCreated event.
+	subscribeToPage := func(targetID proto.TargetTargetID) {
+		mu.Lock()
+		already := tracking[targetID]
+		if !already {
+			tracking[targetID] = true
+		}
+		mu.Unlock()
+		if already {
+			return
+		}
+		go func() {
+			for i := 0; i < 10; i++ {
+				pages, _ := browser.Pages()
+				for _, p := range pages {
+					if p.TargetID == targetID {
+						trackPage(p, logsDir)
+						return
+					}
+				}
+				time.Sleep(10 * time.Millisecond)
+			}
+		}()
+	}
+
+	// TargetSetDiscoverTargets causes Chrome to fire TargetTargetCreated for
+	// all existing targets immediately, and for every new target thereafter.
+	// Set up the listener first so we don't miss events.
+	wait := browser.EachEvent(func(e *proto.TargetTargetCreated) bool {
+		if e.TargetInfo.Type == "page" {
+			subscribeToPage(e.TargetInfo.TargetID)
+		}
+		return false
+	})
+	proto.TargetSetDiscoverTargets{Discover: true}.Call(browser)
+	go wait()
+
+	sigCh := make(chan os.Signal, 1)
+	signal.Notify(sigCh, syscall.SIGINT, syscall.SIGTERM)
+	<-sigCh
+}
+
+// trackPage subscribes to console events for a single page and writes them to
+// a per-page NDJSON file. Blocks until the page is closed or context cancelled.
+//
+// The log file is opened *after* RuntimeEnable returns (which blocks until
+// Chrome acks the command). This means the file's creation on disk is an exact
+// signal that Chrome is ready to send events — waitForLogger relies on this.
+func trackPage(page *rod.Page, logsDir string) {
+	logFile := filepath.Join(logsDir, string(page.TargetID)+".ndjson")
+
+	// Register the listener before enabling so no events are missed.
+	// f starts nil; callback skips writes until f is set below.
+	var f *os.File
+	wait := page.EachEvent(func(e *proto.RuntimeConsoleAPICalled) bool {
+		if f != nil {
+			fmt.Fprintln(f, marshalConsoleEntry(makeConsoleEntry(e)))
+			f.Sync()
+		}
+		return false
+	})
+
+	// Enable runtime; blocks until Chrome acknowledges.
+	if err := (proto.RuntimeEnable{}).Call(page); err != nil {
+		return
+	}
+
+	// Open the log file now. Its appearance on disk is the ready signal
+	// consumed by waitForLogger in cmdOpen/cmdNewPage.
+	var err error
+	f, err = os.OpenFile(logFile, os.O_CREATE|os.O_APPEND|os.O_WRONLY, 0644)
+	if err != nil {
+		return
+	}
+	defer f.Close()
+
+	wait() // blocks until page closed or context cancelled; f is non-nil
+}
+
+// waitForLogger polls until _logger has subscribed to page and called
+// RuntimeEnable (signalled by the log file appearing on disk), or until a
+// 500ms timeout expires. Called before navigating a freshly-created blank page.
+func waitForLogger(page *rod.Page) {
+	logFile := filepath.Join(stateDir(), "logs", string(page.TargetID)+".ndjson")
+	deadline := time.Now().Add(500 * time.Millisecond)
+	for time.Now().Before(deadline) {
+		if _, err := os.Stat(logFile); err == nil {
+			return
+		}
+		time.Sleep(5 * time.Millisecond)
+	}
 }
 
 // --- Auth proxy for environments with authenticated HTTP proxies ---
