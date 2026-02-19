@@ -1148,3 +1148,76 @@ func TestInsecureFlag_WithSelfSignedCert(t *testing.T) {
 		}
 	})
 }
+
+// =====================
+// parseStartFlags tests
+// =====================
+
+func TestParseStartFlags_ShowFlag(t *testing.T) {
+	flags, err := parseStartFlags([]string{"--show"})
+	if err != nil {
+		t.Fatalf("--show should be accepted, got error: %v", err)
+	}
+	if flags.headless {
+		t.Error("expected headless=false when --show is passed")
+	}
+}
+
+func TestParseStartFlags_ShowAndInsecure(t *testing.T) {
+	flags, err := parseStartFlags([]string{"--show", "--insecure"})
+	if err != nil {
+		t.Fatalf("--show --insecure should be accepted, got error: %v", err)
+	}
+	if flags.headless {
+		t.Error("expected headless=false when --show is passed")
+	}
+	if !flags.ignoreCertErrors {
+		t.Error("expected ignoreCertErrors=true when --insecure is passed")
+	}
+}
+
+func TestParseStartFlags_InsecureOnly(t *testing.T) {
+	flags, err := parseStartFlags([]string{"--insecure"})
+	if err != nil {
+		t.Fatalf("--insecure should be accepted, got error: %v", err)
+	}
+	if !flags.headless {
+		t.Error("expected headless=true (default) when --show is not passed")
+	}
+	if !flags.ignoreCertErrors {
+		t.Error("expected ignoreCertErrors=true when --insecure is passed")
+	}
+}
+
+func TestParseStartFlags_KShorthand(t *testing.T) {
+	flags, err := parseStartFlags([]string{"-k"})
+	if err != nil {
+		t.Fatalf("-k should be accepted, got error: %v", err)
+	}
+	if !flags.ignoreCertErrors {
+		t.Error("expected ignoreCertErrors=true when -k is passed")
+	}
+}
+
+func TestParseStartFlags_NoArgs(t *testing.T) {
+	flags, err := parseStartFlags([]string{})
+	if err != nil {
+		t.Fatalf("no args should be accepted, got error: %v", err)
+	}
+	if !flags.headless {
+		t.Error("expected headless=true by default")
+	}
+	if flags.ignoreCertErrors {
+		t.Error("expected ignoreCertErrors=false by default")
+	}
+}
+
+func TestParseStartFlags_UnknownFlag(t *testing.T) {
+	_, err := parseStartFlags([]string{"--bogus"})
+	if err == nil {
+		t.Fatal("expected error for unknown flag --bogus")
+	}
+	if !strings.Contains(err.Error(), "unknown flag: --bogus") {
+		t.Errorf("expected 'unknown flag: --bogus' in error, got: %v", err)
+	}
+}
