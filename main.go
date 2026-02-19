@@ -715,10 +715,25 @@ func cmdPDF(args []string) {
 }
 
 func cmdJS(args []string) {
-	if len(args) < 1 {
-		fatal("usage: rodney js <expression>")
+	var expr string
+	if len(args) == 0 || (len(args) == 1 && args[0] == "-") {
+		if len(args) == 0 {
+			// Only read from stdin automatically if it's piped (not a terminal)
+			if stat, err := os.Stdin.Stat(); err != nil || (stat.Mode()&os.ModeCharDevice) != 0 {
+				fatal("usage: rodney js <expression>")
+			}
+		}
+		data, err := io.ReadAll(os.Stdin)
+		if err != nil {
+			fatal("failed to read stdin: %v", err)
+		}
+		expr = strings.TrimSpace(string(data))
+		if expr == "" {
+			fatal("empty expression from stdin")
+		}
+	} else {
+		expr = strings.Join(args, " ")
 	}
-	expr := strings.Join(args, " ")
 	_, _, page := withPage()
 
 	// Wrap bare expressions in a function
@@ -1431,10 +1446,56 @@ func formatAssertFail(actual string, expected *string, message string) string {
 	return fmt.Sprintf("fail: got %s", actual)
 }
 
-func cmdAssert(args []string) {
-	if len(args) < 1 {
-		fatal("usage: rodney assert <js-expression> [expected] [--message msg]")
+// resolveAssertArgs resolves stdin for `rodney assert`, returning a normalized args
+// slice where the first positional is always the JS expression string (never "-").
+// It mirrors the stdin-detection logic from cmdJS: "-" reads stdin explicitly;
+// no positional args auto-reads stdin when piped; otherwise falls through unchanged.
+func resolveAssertArgs(args []string) []string {
+	// Find index of first positional arg (skipping -m/--message pairs).
+	firstPosIdx := -1
+	for i := 0; i < len(args); i++ {
+		if args[i] == "--message" || args[i] == "-m" {
+			i++ // skip flag value
+			continue
+		}
+		firstPosIdx = i
+		break
 	}
+
+	if firstPosIdx >= 0 && args[firstPosIdx] == "-" {
+		// Explicit stdin: replace "-" with expression read from stdin.
+		data, err := io.ReadAll(os.Stdin)
+		if err != nil {
+			fatal("failed to read stdin: %v", err)
+		}
+		expr := strings.TrimSpace(string(data))
+		if expr == "" {
+			fatal("empty expression from stdin")
+		}
+		newArgs := make([]string, len(args))
+		copy(newArgs, args)
+		newArgs[firstPosIdx] = expr
+		return newArgs
+	} else if firstPosIdx == -1 {
+		// No positional args — auto-read from stdin only if it's piped.
+		if stat, err := os.Stdin.Stat(); err != nil || (stat.Mode()&os.ModeCharDevice) != 0 {
+			fatal("usage: rodney assert <js-expression> [expected] [--message msg]")
+		}
+		data, err := io.ReadAll(os.Stdin)
+		if err != nil {
+			fatal("failed to read stdin: %v", err)
+		}
+		expr := strings.TrimSpace(string(data))
+		if expr == "" {
+			fatal("empty expression from stdin")
+		}
+		return append([]string{expr}, args...)
+	}
+	return args
+}
+
+func cmdAssert(args []string) {
+	args = resolveAssertArgs(args)
 
 	expr, expected, message := parseAssertArgs(args)
 	if expr == "" {

@@ -21,8 +21,9 @@ import (
 
 // testEnv holds a shared browser and test HTTP server for all tests.
 type testEnv struct {
-	browser *rod.Browser
-	server  *httptest.Server
+	browser  *rod.Browser
+	server   *httptest.Server
+	debugURL string // WebSocket debug URL for setting up state in cmdXxx tests
 }
 
 var env *testEnv
@@ -53,7 +54,7 @@ func TestMain(m *testing.M) {
 	mux.HandleFunc("/empty", handleEmpty)
 	server := httptest.NewServer(mux)
 
-	env = &testEnv{browser: browser, server: server}
+	env = &testEnv{browser: browser, server: server, debugURL: u}
 
 	code := m.Run()
 
@@ -1071,6 +1072,197 @@ func TestFormatAssertFail_EqualityWithMessage(t *testing.T) {
 	want := `fail: Wrong page loaded (got "Task Tracker", expected "Dashboard")`
 	if got != want {
 		t.Errorf("got %q, want %q", got, want)
+	}
+}
+
+// ======================
+// cmdJS stdin tests
+// ======================
+
+// setupCmdJSState navigates to path on the test server, writes a state.json
+// in a temp dir pointing at that page, and restores activeStateDir on cleanup.
+func setupCmdJSState(t *testing.T, path string) {
+	t.Helper()
+
+	tmpDir := t.TempDir()
+	oldStateDir := activeStateDir
+	activeStateDir = tmpDir
+	t.Cleanup(func() { activeStateDir = oldStateDir })
+
+	page := env.browser.MustPage(env.server.URL + path)
+	page.MustWaitLoad()
+	t.Cleanup(func() { page.MustClose() })
+
+	// Find the page's index in the browser's page list.
+	pages, err := env.browser.Pages()
+	if err != nil {
+		t.Fatalf("failed to list pages: %v", err)
+	}
+	idx := 0
+	for i, p := range pages {
+		if p.TargetID == page.TargetID {
+			idx = i
+			break
+		}
+	}
+
+	if err := saveState(&State{DebugURL: env.debugURL, ActivePage: idx}); err != nil {
+		t.Fatalf("saveState: %v", err)
+	}
+}
+
+// pipeStdin replaces os.Stdin with a pipe containing content and restores it on cleanup.
+func pipeStdin(t *testing.T, content string) {
+	t.Helper()
+	r, w, err := os.Pipe()
+	if err != nil {
+		t.Fatalf("os.Pipe: %v", err)
+	}
+	if _, err := w.WriteString(content); err != nil {
+		t.Fatalf("pipeStdin write: %v", err)
+	}
+	w.Close()
+	oldStdin := os.Stdin
+	os.Stdin = r
+	t.Cleanup(func() { os.Stdin = oldStdin })
+}
+
+// captureStdout captures everything written to os.Stdout by fn, trimming trailing whitespace.
+func captureStdout(t *testing.T, fn func()) string {
+	t.Helper()
+	r, w, err := os.Pipe()
+	if err != nil {
+		t.Fatalf("os.Pipe: %v", err)
+	}
+	oldStdout := os.Stdout
+	os.Stdout = w
+	fn()
+	w.Close()
+	os.Stdout = oldStdout
+	out, err := io.ReadAll(r)
+	if err != nil {
+		t.Fatalf("captureStdout read: %v", err)
+	}
+	return strings.TrimSpace(string(out))
+}
+
+// TestCmdJS_Stdin_NoArgs verifies that piping an expression to `rodney js`
+// with no arguments reads and evaluates it from stdin.
+func TestCmdJS_Stdin_NoArgs(t *testing.T) {
+	setupCmdJSState(t, "/")
+	pipeStdin(t, "document.title\n")
+	got := captureStdout(t, func() { cmdJS([]string{}) })
+	if got != "Test Page" {
+		t.Errorf("expected 'Test Page', got %q", got)
+	}
+}
+
+// TestCmdJS_Stdin_DashArg verifies that `rodney js -` reads the expression from stdin,
+// consistent with the `-` convention used by `rodney file`.
+func TestCmdJS_Stdin_DashArg(t *testing.T) {
+	setupCmdJSState(t, "/")
+	pipeStdin(t, "document.title\n")
+	got := captureStdout(t, func() { cmdJS([]string{"-"}) })
+	if got != "Test Page" {
+		t.Errorf("expected 'Test Page', got %q", got)
+	}
+}
+
+// TestCmdJS_Stdin_MultiLine verifies multi-line input works — this is exactly what
+// a heredoc produces (bash sends the lines as a single stdin stream with newlines).
+func TestCmdJS_Stdin_MultiLine(t *testing.T) {
+	setupCmdJSState(t, "/")
+	// Heredoc-style: expression split across lines with trailing newline.
+	// `1 +\n2\n` is trimmed to `1 +\n2` and wrapped in `() => { return (1 +\n2); }`.
+	pipeStdin(t, "1 +\n2\n")
+	got := captureStdout(t, func() { cmdJS([]string{}) })
+	if got != "3" {
+		t.Errorf("expected '3', got %q", got)
+	}
+}
+
+// TestCmdJS_Stdin_TrimsWhitespace verifies that leading/trailing whitespace
+// (including the trailing newline added by echo or heredoc) is stripped.
+func TestCmdJS_Stdin_TrimsWhitespace(t *testing.T) {
+	setupCmdJSState(t, "/")
+	pipeStdin(t, "  1 + 2  \n")
+	got := captureStdout(t, func() { cmdJS([]string{}) })
+	if got != "3" {
+		t.Errorf("expected '3', got %q", got)
+	}
+}
+
+// ======================
+// cmdAssert stdin tests
+// ======================
+
+// TestCmdAssert_Stdin_NoArgs verifies that piping a JS expression to `rodney assert`
+// with no other args reads the expression from stdin.
+func TestCmdAssert_Stdin_NoArgs(t *testing.T) {
+	pipeStdin(t, "document.title\n")
+	got := resolveAssertArgs([]string{})
+	if len(got) == 0 || got[0] != "document.title" {
+		t.Errorf("expected args[0] == 'document.title', got %v", got)
+	}
+}
+
+// TestCmdAssert_Stdin_DashArg verifies that `rodney assert -` reads the expression
+// from stdin explicitly, matching the `-` convention used by `rodney js` and `rodney file`.
+func TestCmdAssert_Stdin_DashArg(t *testing.T) {
+	pipeStdin(t, "document.title\n")
+	got := resolveAssertArgs([]string{"-"})
+	if len(got) == 0 || got[0] != "document.title" {
+		t.Errorf("expected args[0] == 'document.title', got %v", got)
+	}
+}
+
+// TestCmdAssert_Stdin_WithExpected verifies that the expression comes from stdin
+// while the expected value still comes from command-line args.
+// Equivalent to: echo "document.title" | rodney assert - "Test Page"
+func TestCmdAssert_Stdin_WithExpected(t *testing.T) {
+	pipeStdin(t, "document.title\n")
+	got := resolveAssertArgs([]string{"-", "Test Page"})
+	if len(got) != 2 || got[0] != "document.title" || got[1] != "Test Page" {
+		t.Errorf("expected [document.title Test Page], got %v", got)
+	}
+}
+
+// TestCmdAssert_Stdin_WithMessage verifies that the expression comes from stdin
+// while the -m flag still comes from command-line args.
+// Equivalent to: echo "document.title" | rodney assert - -m "page title"
+func TestCmdAssert_Stdin_WithMessage(t *testing.T) {
+	pipeStdin(t, "document.title\n")
+	got := resolveAssertArgs([]string{"-", "-m", "page title"})
+	if len(got) != 3 || got[0] != "document.title" || got[1] != "-m" || got[2] != "page title" {
+		t.Errorf("expected [document.title -m page title], got %v", got)
+	}
+}
+
+// TestCmdAssert_Stdin_FlagsOnly verifies that when only flags are given (no positional)
+// and stdin is piped, the expression is prepended from stdin.
+func TestCmdAssert_Stdin_FlagsOnly(t *testing.T) {
+	pipeStdin(t, "document.title\n")
+	got := resolveAssertArgs([]string{"-m", "check"})
+	if len(got) != 3 || got[0] != "document.title" || got[1] != "-m" || got[2] != "check" {
+		t.Errorf("expected [document.title -m check], got %v", got)
+	}
+}
+
+// TestCmdAssert_Stdin_Passthrough verifies that normal (non-stdin) args are unchanged.
+func TestCmdAssert_Stdin_Passthrough(t *testing.T) {
+	got := resolveAssertArgs([]string{"document.title", "Test Page"})
+	if len(got) != 2 || got[0] != "document.title" || got[1] != "Test Page" {
+		t.Errorf("expected [document.title Test Page], got %v", got)
+	}
+}
+
+// TestCmdAssert_Stdin_TrimsWhitespace verifies leading/trailing whitespace is stripped
+// from the stdin expression (consistent with cmdJS behavior).
+func TestCmdAssert_Stdin_TrimsWhitespace(t *testing.T) {
+	pipeStdin(t, "  1 + 2  \n")
+	got := resolveAssertArgs([]string{"-"})
+	if len(got) == 0 || got[0] != "1 + 2" {
+		t.Errorf("expected args[0] == '1 + 2', got %v", got)
 	}
 }
 

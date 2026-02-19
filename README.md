@@ -81,9 +81,14 @@ rodney js "1 + 2"                               # Math
 rodney js 'document.querySelector("h1").textContent'  # DOM queries
 rodney js '[1,2,3].map(x => x * 2)'            # Returns pretty-printed JSON
 rodney js 'document.querySelectorAll("a").length'     # Count elements
+echo 'document.title' | rodney js              # Read expression from stdin
+cat script.js | rodney js                       # Execute a JS file via stdin
+rodney js -                                     # Read from stdin explicitly
 ```
 
 The expression is automatically wrapped in `() => { return (expr); }`.
+
+When no argument is given and stdin is piped, the expression is read from stdin. Pass `-` as the argument to read from stdin explicitly.
 
 ### Interact with elements
 
@@ -418,7 +423,7 @@ The tool uses the [rod](https://github.com/go-rod/rod) Go library which communic
 | `text` | `<selector>` | Print element text content |
 | `attr` | `<selector> <name>` | Print attribute value |
 | `pdf` | `[file]` | Save page as PDF |
-| `js` | `<expression>` | Evaluate JavaScript |
+| `js` | `<expression>\|-` | Evaluate JavaScript (`-` or no arg reads from stdin) |
 | `click` | `<selector>` | Click element |
 | `input` | `<selector> <text>` | Type into input |
 | `clear` | `<selector>` | Clear input |
