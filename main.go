@@ -84,6 +84,12 @@ type State struct {
 	DataDir     string `json:"data_dir"`
 	ProxyPID    int    `json:"proxy_pid,omitempty"`  // PID of auth proxy helper
 	ProxyPort   int    `json:"proxy_port,omitempty"` // local port of auth proxy
+
+	// Viewport overrides (set by "rodney viewport", re-applied on each connection)
+	ViewportWidth  int     `json:"viewport_width,omitempty"`
+	ViewportHeight int     `json:"viewport_height,omitempty"`
+	ViewportScale  float64 `json:"viewport_scale,omitempty"`
+	ViewportMobile bool    `json:"viewport_mobile,omitempty"`
 }
 
 func stateDir() string {
@@ -253,6 +259,8 @@ func main() {
 		cmdScreenshot(args)
 	case "screenshot-el":
 		cmdScreenshotEl(args)
+	case "viewport":
+		cmdViewport(args)
 	case "pages":
 		cmdPages(args)
 	case "page":
@@ -313,20 +321,98 @@ func withPage() (*State, *rod.Browser, *rod.Page) {
 	}
 	// Apply default timeout so element queries don't hang forever
 	page = page.Timeout(defaultTimeout)
+
+	// Re-apply viewport override if set via "rodney viewport"
+	if s.ViewportWidth > 0 && s.ViewportHeight > 0 {
+		scale := s.ViewportScale
+		if scale == 0 {
+			scale = 1
+		}
+		if err := (proto.EmulationSetDeviceMetricsOverride{
+			Width:             s.ViewportWidth,
+			Height:            s.ViewportHeight,
+			DeviceScaleFactor: scale,
+			Mobile:            s.ViewportMobile,
+		}.Call(page)); err != nil {
+			fmt.Fprintf(os.Stderr, "warning: failed to re-apply viewport: %v\n", err)
+		}
+	}
+
 	return s, browser, page
+}
+
+// formatViewportDesc returns a human-readable description of viewport settings.
+func formatViewportDesc(prefix string, w, h int, mobile bool, scale float64) string {
+	desc := fmt.Sprintf("%s %dx%d", prefix, w, h)
+	var extras []string
+	if mobile {
+		extras = append(extras, "mobile")
+	}
+	if scale != 0 && scale != 1 {
+		extras = append(extras, fmt.Sprintf("scale %g", scale))
+	}
+	if len(extras) > 0 {
+		desc += " (" + strings.Join(extras, ", ") + ")"
+	}
+	return desc
 }
 
 // --- Commands ---
 
 func cmdStart(args []string) {
 	ignoreCertErrors := false
+	headless := true
+	vpWidth, vpHeight := 0, 0
+	vpScale := 0.0
+	vpMobile := false
+
 	for i := 0; i < len(args); i++ {
 		switch args[i] {
 		case "--insecure", "-k":
 			ignoreCertErrors = true
+		case "--show":
+			headless = false
+		case "--mobile":
+			vpMobile = true
+		case "--scale":
+			i++
+			if i >= len(args) {
+				fatal("missing value for --scale")
+			}
+			v, err := strconv.ParseFloat(args[i], 64)
+			if err != nil {
+				fatal("invalid scale: %v", err)
+			}
+			vpScale = v
+		case "--viewport":
+			i++
+			if i >= len(args) {
+				fatal("missing value for --viewport (expected WxH, e.g. 375x812)")
+			}
+			parts := strings.SplitN(args[i], "x", 2)
+			if len(parts) != 2 {
+				fatal("invalid viewport format: %q (expected WxH, e.g. 375x812)", args[i])
+			}
+			w, err := strconv.Atoi(parts[0])
+			if err != nil {
+				fatal("invalid viewport width: %v", err)
+			}
+			h, err := strconv.Atoi(parts[1])
+			if err != nil {
+				fatal("invalid viewport height: %v", err)
+			}
+			vpWidth, vpHeight = w, h
 		default:
-			fatal("unknown flag: %s\nusage: rodney start [--insecure]", args[i])
+			fatal("unknown flag: %s\nusage: rodney start [--show] [--insecure|-k] [--viewport WxH] [--mobile] [--scale N]", args[i])
 		}
+	}
+
+	if (vpMobile || vpScale != 0) && vpWidth == 0 {
+		fatal("--mobile and --scale require --viewport")
+	}
+
+	if vpWidth > 0 && vpScale == 0 {
+		vpScale = 1
 	}
 
 	// Check if already running
@@ -336,14 +422,6 @@ func cmdStart(args []string) {
 			b.MustClose()
 			// It was actually running, warn
 			removeState()
-		}
-	}
-
-	// Parse flags
-	headless := true
-	for _, arg := range args {
-		if arg == "--show" {
-			headless = false
 		}
 	}
 
@@ -411,12 +489,16 @@ func cmdStart(args []string) {
 	pid := l.PID()
 
 	state := &State{
-		DebugURL:   debugURL,
-		ChromePID:  pid,
-		ActivePage: 0,
-		DataDir:    dataDir,
-		ProxyPID:   proxyPID,
-		ProxyPort:  proxyPort,
+		DebugURL:       debugURL,
+		ChromePID:      pid,
+		ActivePage:     0,
+		DataDir:        dataDir,
+		ProxyPID:       proxyPID,
+		ProxyPort:      proxyPort,
+		ViewportWidth:  vpWidth,
+		ViewportHeight: vpHeight,
+		ViewportScale:  vpScale,
+		ViewportMobile: vpMobile,
 	}
 
 	if err := saveState(state); err != nil {
@@ -425,6 +507,9 @@ func cmdStart(args []string) {
 
 	fmt.Printf("Chrome started (PID %d)\n", pid)
 	fmt.Printf("Debug URL: %s\n", debugURL)
+	if vpWidth > 0 && vpHeight > 0 {
+		fmt.Println(formatViewportDesc("Viewport:", vpWidth, vpHeight, vpMobile, vpScale))
+	}
 }
 
 func cmdConnect(args []string) {
@@ -1101,11 +1186,96 @@ func nextAvailableFile(base, ext string) string {
 	}
 }
 
+func cmdViewport(args []string) {
+	if len(args) < 1 {
+		fatal("usage: rodney viewport <width> <height> [--scale N] [--mobile]\n       rodney viewport --reset")
+	}
+
+	// Handle --reset: clear viewport override and restore browser defaults
+	if args[0] == "--reset" {
+		s, _, page := withPage()
+
+		if err := (proto.EmulationClearDeviceMetricsOverride{}.Call(page)); err != nil {
+			fatal("failed to clear viewport override: %v", err)
+		}
+
+		s.ViewportWidth = 0
+		s.ViewportHeight = 0
+		s.ViewportScale = 0
+		s.ViewportMobile = false
+		if err := saveState(s); err != nil {
+			fatal("failed to save state: %v", err)
+		}
+
+		fmt.Println("Viewport reset to browser default")
+		return
+	}
+
+	if len(args) < 2 {
+		fatal("usage: rodney viewport <width> <height> [--scale N] [--mobile]\n       rodney viewport --reset")
+	}
+
+	w, err := strconv.Atoi(args[0])
+	if err != nil {
+		fatal("invalid width: %v", err)
+	}
+	h, err := strconv.Atoi(args[1])
+	if err != nil {
+		fatal("invalid height: %v", err)
+	}
+
+	scale := 1.0
+	mobile := false
+
+	for i := 2; i < len(args); i++ {
+		switch args[i] {
+		case "--scale":
+			i++
+			if i >= len(args) {
+				fatal("missing value for --scale")
+			}
+			v, err := strconv.ParseFloat(args[i], 64)
+			if err != nil {
+				fatal("invalid scale: %v", err)
+			}
+			scale = v
+		case "--mobile":
+			mobile = true
+		default:
+			fatal("unknown flag: %s", args[i])
+		}
+	}
+
+	s, _, page := withPage()
+
+	err = proto.EmulationSetDeviceMetricsOverride{
+		Width:             w,
+		Height:            h,
+		DeviceScaleFactor: scale,
+		Mobile:            mobile,
+	}.Call(page)
+	if err != nil {
+		fatal("failed to set viewport: %v", err)
+	}
+
+	// Persist viewport settings so they are re-applied on each subsequent command
+	s.ViewportWidth = w
+	s.ViewportHeight = h
+	s.ViewportScale = scale
+	s.ViewportMobile = mobile
+	if err := saveState(s); err != nil {
+		fatal("failed to save state: %v", err)
+	}
+
+	fmt.Println(formatViewportDesc("Viewport set to", w, h, mobile, scale))
+}
+
 func cmdScreenshot(args []string) {
 	var file string
-	width := 1280
+	width := 0
 	height := 0
 	fullPage := true
+	sizeExplicit := false
 
 	// Parse flags and positional args
 	var positional []string
@@ -1121,6 +1291,7 @@ func cmdScreenshot(args []string) {
 				fatal("invalid width: %v", err)
 			}
 			width = v
+			sizeExplicit = true
 		case "-h", "--height":
 			i++
 			if i >= len(args) {
@@ -1132,6 +1303,7 @@ func cmdScreenshot(args []string) {
 			}
 			height = v
 			fullPage = false
+			sizeExplicit = true
 		default:
 			positional = append(positional, args[i])
 		}
@@ -1143,20 +1315,26 @@ func cmdScreenshot(args []string) {
 		file = nextAvailableFile("screenshot", ".png")
 	}
 
-	_, _, page := withPage()
+	s, _, page := withPage()
 
-	// Set viewport size
-	viewportHeight := height
-	if viewportHeight == 0 {
-		viewportHeight = 720
-	}
-	err := proto.EmulationSetDeviceMetricsOverride{
-		Width:             width,
-		Height:            viewportHeight,
-		DeviceScaleFactor: 1,
-	}.Call(page)
-	if err != nil {
-		fatal("failed to set viewport: %v", err)
+	// Only override viewport if -w/-h were explicitly passed, or if no
+	// viewport has been set via "rodney viewport"
+	if sizeExplicit || s.ViewportWidth == 0 {
+		if width == 0 {
+			width = 1280
+		}
+		viewportHeight := height
+		if viewportHeight == 0 {
+			viewportHeight = 720
+		}
+		err := proto.EmulationSetDeviceMetricsOverride{
+			Width:             width,
+			Height:            viewportHeight,
+			DeviceScaleFactor: 1,
+		}.Call(page)
+		if err != nil {
+			fatal("failed to set viewport: %v", err)
+		}
 	}
 
 	data, err := page.Screenshot(fullPage, nil)

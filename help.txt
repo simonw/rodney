@@ -1,7 +1,8 @@
 rodney - Chrome automation from the command line
 
 Browser lifecycle:
-  rodney start [--show] [--insecure | -k]  Launch Chrome (headless by default, --show for visible)
+  rodney start [--show] [--insecure | -k] [--viewport WxH] [--mobile] [--scale N]
+                                Launch Chrome (headless by default, --show for visible)
   rodney connect <host:port>      Connect to existing Chrome on remote debug port
   rodney stop                     Shut down Chrome
   rodney status                   Show browser status
@@ -43,6 +44,10 @@ Waiting:
 Screenshots:
   rodney screenshot [-w N] [-h N] [file]  Take page screenshot
   rodney screenshot-el <sel> [f]  Screenshot an element
+
+Viewport:
+  rodney viewport <w> <h> [--scale N] [--mobile]  Set viewport size
+  rodney viewport --reset                          Reset to browser default
 
 Tabs:
   rodney pages                    List all pages/tabs

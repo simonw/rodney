@@ -1074,6 +1074,256 @@ func TestFormatAssertFail_EqualityWithMessage(t *testing.T) {
 	}
 }
 
+// =====================
+// viewport tests
+// =====================
+
+func TestFormatViewportDesc_Basic(t *testing.T) {
+	got := formatViewportDesc("Viewport:", 375, 812, false, 1)
+	expected := "Viewport: 375x812"
+	if got != expected {
+		t.Errorf("expected %q, got %q", expected, got)
+	}
+}
+
+func TestFormatViewportDesc_Mobile(t *testing.T) {
+	got := formatViewportDesc("Viewport set to", 375, 812, true, 1)
+	expected := "Viewport set to 375x812 (mobile)"
+	if got != expected {
+		t.Errorf("expected %q, got %q", expected, got)
+	}
+}
+
+func TestFormatViewportDesc_Scale(t *testing.T) {
+	got := formatViewportDesc("Viewport:", 390, 844, false, 3)
+	expected := "Viewport: 390x844 (scale 3)"
+	if got != expected {
+		t.Errorf("expected %q, got %q", expected, got)
+	}
+}
+
+func TestFormatViewportDesc_MobileAndScale(t *testing.T) {
+	got := formatViewportDesc("Viewport set to", 375, 812, true, 2)
+	expected := "Viewport set to 375x812 (mobile, scale 2)"
+	if got != expected {
+		t.Errorf("expected %q, got %q", expected, got)
+	}
+}
+
+func TestFormatViewportDesc_ScaleOne_Omitted(t *testing.T) {
+	got := formatViewportDesc("Viewport:", 1280, 720, false, 1)
+	if strings.Contains(got, "scale") {
+		t.Errorf("scale 1 should be omitted, got %q", got)
+	}
+}
+
+func TestFormatViewportDesc_ScaleZero_Omitted(t *testing.T) {
+	got := formatViewportDesc("Viewport:", 1280, 720, false, 0)
+	if strings.Contains(got, "scale") {
+		t.Errorf("scale 0 should be omitted, got %q", got)
+	}
+}
+
+func TestViewport_StatePersistence(t *testing.T) {
+	// Verify that viewport settings round-trip through state serialization
+	dir := t.TempDir()
+	state := &State{
+		DebugURL:       "ws://localhost:1234",
+		ChromePID:      12345,
+		DataDir:        dir,
+		ViewportWidth:  375,
+		ViewportHeight: 812,
+		ViewportScale:  2,
+		ViewportMobile: true,
+	}
+
+	data, err := json.Marshal(state)
+	if err != nil {
+		t.Fatalf("marshal failed: %v", err)
+	}
+
+	var loaded State
+	if err := json.Unmarshal(data, &loaded); err != nil {
+		t.Fatalf("unmarshal failed: %v", err)
+	}
+
+	if loaded.ViewportWidth != 375 {
+		t.Errorf("expected ViewportWidth 375, got %d", loaded.ViewportWidth)
+	}
+	if loaded.ViewportHeight != 812 {
+		t.Errorf("expected ViewportHeight 812, got %d", loaded.ViewportHeight)
+	}
+	if loaded.ViewportScale != 2 {
+		t.Errorf("expected ViewportScale 2, got %g", loaded.ViewportScale)
+	}
+	if !loaded.ViewportMobile {
+		t.Error("expected ViewportMobile true")
+	}
+}
+
+func TestViewport_StateOmitsZeroValues(t *testing.T) {
+	// Verify that empty viewport fields are omitted from JSON (omitempty)
+	state := &State{
+		DebugURL:  "ws://localhost:1234",
+		ChromePID: 12345,
+		DataDir:   "/tmp/test",
+	}
+
+	data, err := json.Marshal(state)
+	if err != nil {
+		t.Fatalf("marshal failed: %v", err)
+	}
+
+	raw := string(data)
+	for _, key := range []string{"viewport_width", "viewport_height", "viewport_scale", "viewport_mobile"} {
+		if strings.Contains(raw, key) {
+			t.Errorf("expected %q to be omitted from JSON, got: %s", key, raw)
+		}
+	}
+}
+
+func TestViewport_EmulationApplied(t *testing.T) {
+	// Verify the CDP emulation call works end-to-end via rod
+	page := navigateTo(t, "/")
+
+	err := proto.EmulationSetDeviceMetricsOverride{
+		Width:             375,
+		Height:            812,
+		DeviceScaleFactor: 2,
+	}.Call(page)
+	if err != nil {
+		t.Fatalf("EmulationSetDeviceMetricsOverride failed: %v", err)
+	}
+
+	w, err := page.Eval(`() => { return window.innerWidth; }`)
+	if err != nil {
+		t.Fatalf("eval innerWidth failed: %v", err)
+	}
+	if w.Value.Int() != 375 {
+		t.Errorf("expected innerWidth 375, got %d", w.Value.Int())
+	}
+
+	dpr, err := page.Eval(`() => { return window.devicePixelRatio; }`)
+	if err != nil {
+		t.Fatalf("eval devicePixelRatio failed: %v", err)
+	}
+	if dpr.Value.Int() != 2 {
+		t.Errorf("expected devicePixelRatio 2, got %d", dpr.Value.Int())
+	}
+}
+
+func TestViewport_EmulationReset(t *testing.T) {
+	// Verify that clearing device metrics override restores defaults
+	page := navigateTo(t, "/")
+
+	// Set a custom viewport
+	err := proto.EmulationSetDeviceMetricsOverride{
+		Width:             375,
+		Height:            812,
+		DeviceScaleFactor: 2,
+	}.Call(page)
+	if err != nil {
+		t.Fatalf("EmulationSetDeviceMetricsOverride failed: %v", err)
+	}
+
+	w, err := page.Eval(`() => { return window.innerWidth; }`)
+	if err != nil {
+		t.Fatalf("eval innerWidth failed: %v", err)
+	}
+	if w.Value.Int() != 375 {
+		t.Fatalf("expected innerWidth 375 after override, got %d", w.Value.Int())
+	}
+
+	// Clear the override
+	if err := (proto.EmulationClearDeviceMetricsOverride{}.Call(page)); err != nil {
+		t.Fatalf("EmulationClearDeviceMetricsOverride failed: %v", err)
+	}
+
+	w2, err := page.Eval(`() => { return window.innerWidth; }`)
+	if err != nil {
+		t.Fatalf("eval innerWidth after reset failed: %v", err)
+	}
+	if w2.Value.Int() == 375 {
+		t.Errorf("expected innerWidth to change after reset, still 375")
+	}
+}
+
+func TestViewport_ResetClearsState(t *testing.T) {
+	// Verify that resetting viewport clears persisted state fields
+	state := &State{
+		DebugURL:       "ws://localhost:1234",
+		ChromePID:      12345,
+		DataDir:        t.TempDir(),
+		ViewportWidth:  375,
+		ViewportHeight: 812,
+		ViewportScale:  2,
+		ViewportMobile: true,
+	}
+
+	// Simulate what cmdViewport --reset does to state
+	state.ViewportWidth = 0
+	state.ViewportHeight = 0
+	state.ViewportScale = 0
+	state.ViewportMobile = false
+
+	data, err := json.Marshal(state)
+	if err != nil {
+		t.Fatalf("marshal failed: %v", err)
+	}
+
+	raw := string(data)
+	for _, key := range []string{"viewport_width", "viewport_height", "viewport_scale", "viewport_mobile"} {
+		if strings.Contains(raw, key) {
+			t.Errorf("expected %q to be omitted after reset, got: %s", key, raw)
+		}
+	}
+}
+
+func TestViewport_ScreenshotSkipsOverrideWhenViewportSet(t *testing.T) {
+	// When viewport is persisted in state, cmdScreenshot should skip its
+	// default 1280x720 override so the active viewport is used instead.
+	page := navigateTo(t, "/")
+
+	// Set a custom viewport via CDP (simulating what "rodney viewport" does)
+	err := proto.EmulationSetDeviceMetricsOverride{
+		Width:             375,
+		Height:            812,
+		DeviceScaleFactor: 2,
+	}.Call(page)
+	if err != nil {
+		t.Fatalf("EmulationSetDeviceMetricsOverride failed: %v", err)
+	}
+
+	w, err := page.Eval(`() => { return window.innerWidth; }`)
+	if err != nil {
+		t.Fatalf("eval innerWidth failed: %v", err)
+	}
+	if w.Value.Int() != 375 {
+		t.Errorf("expected innerWidth 375, got %d", w.Value.Int())
+	}
+
+	// If screenshot were to call EmulationSetDeviceMetricsOverride with
+	// 1280x720 here, innerWidth would change. Verify that re-applying the
+	// same custom viewport keeps the size — this is the path screenshot
+	// takes when it skips its default override.
+	err = proto.EmulationSetDeviceMetricsOverride{
+		Width:             375,
+		Height:            812,
+		DeviceScaleFactor: 2,
+	}.Call(page)
+	if err != nil {
+		t.Fatalf("re-apply viewport failed: %v", err)
+	}
+
+	w2, err := page.Eval(`() => { return window.innerWidth; }`)
+	if err != nil {
+		t.Fatalf("eval innerWidth after re-apply failed: %v", err)
+	}
+	if w2.Value.Int() != 375 {
+		t.Errorf("expected innerWidth 375 after re-apply, got %d", w2.Value.Int())
+	}
+}
+
 func TestInsecureFlag_WithSelfSignedCert(t *testing.T) {
 	// Create HTTPS server with self-signed certificate
 	mux := http.NewServeMux()

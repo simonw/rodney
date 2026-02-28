@@ -44,6 +44,7 @@ Requires:
 rodney start              # Launch headless Chrome
 rodney start --show       # Launch with visible browser window
 rodney start --insecure   # Launch with TLS errors ignored (-k shorthand)
+rodney start --viewport 375x812 --mobile --scale 2  # Start with mobile viewport
 rodney connect host:9222  # Connect to existing Chrome on remote debug port
 rodney status             # Show browser info and active page
 rodney stop               # Shut down Chrome
@@ -116,8 +117,20 @@ rodney sleep 2.5            # Sleep for N seconds
 ```bash
 rodney screenshot                         # Save as screenshot.png
 rodney screenshot page.png                # Save to specific file
-rodney screenshot -w 1280 -h 720 out.png  # Set viewport width/height
+rodney screenshot -w 1280 -h 720 out.png  # Override viewport width/height
 rodney screenshot-el ".chart" chart.png   # Screenshot specific element
+```
+
+When a viewport has been set via `rodney viewport`, screenshots use that viewport by default. Pass `-w`/`-h` to override.
+
+### Viewport / mobile emulation
+
+```bash
+rodney viewport 375 812                      # iPhone-sized viewport
+rodney viewport 375 812 --mobile             # With mobile emulation (viewport meta, etc.)
+rodney viewport 375 812 --mobile --scale 3   # Retina-class device pixel ratio
+rodney viewport 1280 720                     # Desktop viewport
+rodney viewport --reset                      # Reset to browser default
 ```
 
 ### Manage tabs
@@ -403,7 +416,7 @@ The tool uses the [rod](https://github.com/go-rod/rod) Go library which communic
 
 | Command | Arguments | Description |
 |---|---|---|
-| `start` | `[--show] [--insecure\|-k]` | Launch Chrome (headless by default, `--show` for visible) |
+| `start` | `[--show] [--insecure\|-k] [--viewport WxH] [--mobile] [--scale N]` | Launch Chrome (headless by default, `--show` for visible) |
 | `connect` | `<host:port>` | Connect to existing Chrome on remote debug port |
 | `stop` | | Shut down Chrome |
 | `status` | | Show browser status |
@@ -435,6 +448,8 @@ The tool uses the [rod](https://github.com/go-rod/rod) Go library which communic
 | `sleep` | `<seconds>` | Sleep N seconds |
 | `screenshot` | `[-w N] [-h N] [file]` | Page screenshot (optional viewport size) |
 | `screenshot-el` | `<selector> [file]` | Element screenshot |
+| `viewport` | `<width> <height> [--scale N] [--mobile]` | Set browser viewport size |
+| `viewport` | `--reset` | Reset viewport to browser default |
 | `pages` | | List tabs |
 | `page` | `<index>` | Switch tab |
 | `newpage` | `[url]` | Open new tab |
