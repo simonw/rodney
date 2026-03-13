@@ -381,7 +381,7 @@ In environments with authenticated HTTP proxies (e.g., `HTTPS_PROXY=http://user:
 
 This is necessary because Chrome cannot natively authenticate to proxies during HTTPS tunnel (CONNECT) establishment. The local proxy runs as a background process and is automatically cleaned up by `rodney stop`.
 
-See [claude-code-chrome-proxy.md](claude-code-chrome-proxy.md) for detailed technical notes.
+See [notes/claude-chrome-proxy](notes/claude-chrome-proxy) for detailed technical notes.
 
 ## How it works
 
