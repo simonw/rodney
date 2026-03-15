@@ -7,6 +7,42 @@
 
 A Go CLI tool that drives a persistent headless Chrome instance using the [rod](https://github.com/go-rod/rod) browser automation library. Each command connects to the same long-running Chrome process, making it easy to script multi-step browser interactions from shell scripts or interactive use.
 
+## Installation
+
+This Go tool can be installed directly [from PyPI](https://pypi.org/project/rodney/) using `pip` or `uv`.
+
+You can run it without installing it first using `uvx`:
+
+```bash
+uvx rodney --help
+```
+Or install it like this, then run `rodney --help`:
+```bash
+uv tool install rodney
+# or
+pip install rodney
+```
+
+You can also install the Go binary directly:
+```bash
+go install github.com/simonw/rodney@latest
+```
+Or run it without installation like this:
+```bash
+go run github.com/simonw/rodney@latest --help
+```
+Compiled binaries are available [on the releases page](https://github.com/simonw/rodney/releases). On macOS you may need to [follow these extra steps](https://support.apple.com/en-us/102445) to use those.
+
+## Building
+
+```bash
+go build -o rodney .
+```
+
+Requires:
+- Go 1.21+
+- Google Chrome or Chromium installed (or set `ROD_CHROME_BIN=/path/to/chrome`)
+
 ## Architecture
 
 ```
@@ -25,16 +61,6 @@ rodney stop           →  connects and shuts down Chrome, cleans up state
 ```
 
 Each CLI invocation is a short-lived process. Chrome runs independently and tabs persist between commands.
-
-## Building
-
-```bash
-go build -o rodney .
-```
-
-Requires:
-- Go 1.21+
-- Google Chrome or Chromium installed (or set `ROD_CHROME_BIN=/path/to/chrome`)
 
 ## Usage
 
