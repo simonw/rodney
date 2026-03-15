@@ -366,6 +366,7 @@ This pattern is useful in CI — run Rodney as a post-deploy check, an accessibi
 |---|---|---|
 | `RODNEY_HOME` | `~/.rodney` | Data directory for state and Chrome profile |
 | `ROD_CHROME_BIN` | `/usr/bin/google-chrome` | Path to Chrome/Chromium binary |
+| `ROD_CHROME_ARGS` | (none) | Extra Chrome flags as space-separated args (for example `disable-features=HttpsUpgrades`) |
 | `ROD_TIMEOUT` | `30` | Default timeout in seconds for element queries |
 | `HTTPS_PROXY` / `HTTP_PROXY` | (none) | Authenticated proxy auto-detected on start |
 

@@ -72,6 +72,9 @@ current directory, the local session is used; otherwise the global session.
 Use "rodney start --local" to create a directory-scoped session.
 
 Environment:
+  ROD_CHROME_BIN                  Path to Chrome/Chromium binary
+  ROD_CHROME_ARGS                 Extra Chrome flags (space-separated)
+  ROD_TIMEOUT                     Default element query timeout in seconds
   RODNEY_HOME                     Override data directory (default: ~/.rodney)
 
 Exit codes:
