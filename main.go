@@ -85,6 +85,7 @@ type State struct {
 	DataDir     string `json:"data_dir"`
 	ProxyPID    int    `json:"proxy_pid,omitempty"`  // PID of auth proxy helper
 	ProxyPort   int    `json:"proxy_port,omitempty"` // local port of auth proxy
+	Label       string `json:"label,omitempty"`      // optional label to identify this instance
 }
 
 func stateDir() string {
@@ -152,6 +153,123 @@ func getActivePage(browser *rod.Browser, s *State) (*rod.Page, error) {
 		idx = 0
 	}
 	return pages[idx], nil
+}
+
+// pidAlive checks whether a process with the given PID is still running.
+func pidAlive(pid int) bool {
+	return syscall.Kill(pid, 0) == nil
+}
+
+// listEntry represents a discovered rodney instance.
+type listEntry struct {
+	Dir   string
+	State *State
+	Alive bool
+}
+
+// discoverInstances scans known locations for rodney state files.
+func discoverInstances() []listEntry {
+	var entries []listEntry
+	seen := map[string]bool{}
+
+	tryDir := func(dir string) {
+		sp := filepath.Join(dir, "state.json")
+		if seen[sp] {
+			return
+		}
+		seen[sp] = true
+		data, err := os.ReadFile(sp)
+		if err != nil {
+			return
+		}
+		var s State
+		if err := json.Unmarshal(data, &s); err != nil {
+			return
+		}
+		entries = append(entries, listEntry{
+			Dir:   dir,
+			State: &s,
+			Alive: s.ChromePID > 0 && pidAlive(s.ChromePID),
+		})
+	}
+
+	// Global default
+	home, _ := os.UserHomeDir()
+	tryDir(filepath.Join(home, ".rodney"))
+
+	// RODNEY_HOME override
+	if rh := os.Getenv("RODNEY_HOME"); rh != "" {
+		tryDir(rh)
+	}
+
+	// Local session in cwd
+	if cwd, err := os.Getwd(); err == nil {
+		tryDir(filepath.Join(cwd, ".rodney"))
+	}
+
+	// Scan /tmp/rodney-* for RODNEY_HOME-based sessions
+	matches, _ := filepath.Glob("/tmp/rodney-*")
+	for _, m := range matches {
+		tryDir(m)
+	}
+
+	return entries
+}
+
+func cmdList(args []string) {
+	entries := discoverInstances()
+	if len(entries) == 0 {
+		fmt.Println("No rodney instances found")
+		return
+	}
+	for _, e := range entries {
+		status := "alive"
+		if !e.Alive {
+			status = "dead"
+		}
+		label := ""
+		if e.State.Label != "" {
+			label = fmt.Sprintf("  label=%s", e.State.Label)
+		}
+		fmt.Printf("%-30s  pid=%-8d  %s%s\n", e.Dir, e.State.ChromePID, status, label)
+	}
+}
+
+func cmdCleanup(args []string) {
+	all := false
+	for _, a := range args {
+		if a == "--all" {
+			all = true
+		}
+	}
+
+	entries := discoverInstances()
+	if len(entries) == 0 {
+		fmt.Println("No rodney instances found")
+		return
+	}
+
+	cleaned := 0
+	for _, e := range entries {
+		if e.Alive && !all {
+			continue
+		}
+		if e.Alive {
+			// --all: kill the Chrome process
+			syscall.Kill(e.State.ChromePID, syscall.SIGTERM)
+			if e.State.ProxyPID > 0 {
+				syscall.Kill(e.State.ProxyPID, syscall.SIGTERM)
+			}
+			fmt.Printf("Stopped: %s (pid=%d label=%s)\n", e.Dir, e.State.ChromePID, e.State.Label)
+		} else {
+			fmt.Printf("Cleaned: %s (pid=%d label=%s)\n", e.Dir, e.State.ChromePID, e.State.Label)
+		}
+		os.Remove(filepath.Join(e.Dir, "state.json"))
+		cleaned++
+	}
+	if cleaned == 0 {
+		fmt.Println("Nothing to clean up")
+	}
 }
 
 func printUsage() {
@@ -293,6 +411,10 @@ func main() {
 		cmdAXFind(args)
 	case "ax-node":
 		cmdAXNode(args)
+	case "list":
+		cmdList(args)
+	case "cleanup":
+		cmdCleanup(args)
 	case "help", "-h", "--help":
 		printUsage()
 		os.Exit(0)
@@ -337,26 +459,27 @@ func withPage() (*State, *rod.Browser, *rod.Page) {
 // --- Commands ---
 
 // parseStartArgs parses the flags for the "start" command.
-// Returns ignoreCertErrors, headless, and an error for unknown flags.
-func parseStartArgs(args []string) (ignoreCertErrors bool, headless bool, err error) {
+// Returns ignoreCertErrors, headless, label, and an error for unknown flags.
+func parseStartArgs(args []string) (ignoreCertErrors bool, headless bool, label string, err error) {
 	fs := flag.NewFlagSet("start", flag.ContinueOnError)
 	fs.SetOutput(io.Discard)
 	fs.BoolVar(&ignoreCertErrors, "insecure", false, "")
 	fs.BoolVar(&ignoreCertErrors, "k", false, "")
 	show := fs.Bool("show", false, "")
+	fs.StringVar(&label, "label", "", "")
 
 	if parseErr := fs.Parse(args); parseErr != nil {
-		return false, true, fmt.Errorf("unknown flag: %s\nusage: rodney start [--show] [--insecure]", findUnknownFlag(args, fs))
+		return false, true, "", fmt.Errorf("unknown flag: %s\nusage: rodney start [--show] [--insecure] [--label=NAME]", findUnknownFlag(args, fs))
 	}
 	if fs.NArg() > 0 {
-		return false, true, fmt.Errorf("unknown flag: %s\nusage: rodney start [--show] [--insecure]", fs.Arg(0))
+		return false, true, "", fmt.Errorf("unknown flag: %s\nusage: rodney start [--show] [--insecure] [--label=NAME]", fs.Arg(0))
 	}
 	headless = !*show
-	return ignoreCertErrors, headless, nil
+	return ignoreCertErrors, headless, label, nil
 }
 
 func cmdStart(args []string) {
-	ignoreCertErrors, headless, err := parseStartArgs(args)
+	ignoreCertErrors, headless, label, err := parseStartArgs(args)
 	if err != nil {
 		fatal("%s", err)
 	}
@@ -441,6 +564,7 @@ func cmdStart(args []string) {
 		DataDir:    dataDir,
 		ProxyPID:   proxyPID,
 		ProxyPort:  proxyPort,
+		Label:      label,
 	}
 
 	if err := saveState(state); err != nil {
@@ -540,6 +664,9 @@ func cmdStatus(args []string) {
 	pages, _ := browser.Pages()
 	fmt.Printf("Browser running (PID %d)\n", s.ChromePID)
 	fmt.Printf("Debug URL: %s\n", s.DebugURL)
+	if s.Label != "" {
+		fmt.Printf("Label: %s\n", s.Label)
+	}
 	fmt.Printf("Pages: %d\n", len(pages))
 	fmt.Printf("Active page: %d\n", s.ActivePage)
 	if page, err := getActivePage(browser, s); err == nil {

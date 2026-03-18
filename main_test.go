@@ -1079,7 +1079,7 @@ func TestFormatAssertFail_EqualityWithMessage(t *testing.T) {
 // =====================
 
 func TestParseStartArgs_NoFlags(t *testing.T) {
-	insecure, headless, err := parseStartArgs([]string{})
+	insecure, headless, label, err := parseStartArgs([]string{})
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
@@ -1089,10 +1089,13 @@ func TestParseStartArgs_NoFlags(t *testing.T) {
 	if !headless {
 		t.Error("expected headless=true with no flags")
 	}
+	if label != "" {
+		t.Errorf("expected empty label, got %q", label)
+	}
 }
 
 func TestParseStartArgs_ShowFlag(t *testing.T) {
-	insecure, headless, err := parseStartArgs([]string{"--show"})
+	insecure, headless, _, err := parseStartArgs([]string{"--show"})
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
@@ -1105,7 +1108,7 @@ func TestParseStartArgs_ShowFlag(t *testing.T) {
 }
 
 func TestParseStartArgs_InsecureFlag(t *testing.T) {
-	insecure, headless, err := parseStartArgs([]string{"--insecure"})
+	insecure, headless, _, err := parseStartArgs([]string{"--insecure"})
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
@@ -1118,7 +1121,7 @@ func TestParseStartArgs_InsecureFlag(t *testing.T) {
 }
 
 func TestParseStartArgs_InsecureShortFlag(t *testing.T) {
-	insecure, _, err := parseStartArgs([]string{"-k"})
+	insecure, _, _, err := parseStartArgs([]string{"-k"})
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
@@ -1128,7 +1131,7 @@ func TestParseStartArgs_InsecureShortFlag(t *testing.T) {
 }
 
 func TestParseStartArgs_ShowAndInsecure(t *testing.T) {
-	insecure, headless, err := parseStartArgs([]string{"--show", "--insecure"})
+	insecure, headless, _, err := parseStartArgs([]string{"--show", "--insecure"})
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
@@ -1141,12 +1144,109 @@ func TestParseStartArgs_ShowAndInsecure(t *testing.T) {
 }
 
 func TestParseStartArgs_UnknownFlag(t *testing.T) {
-	_, _, err := parseStartArgs([]string{"--bogus"})
+	_, _, _, err := parseStartArgs([]string{"--bogus"})
 	if err == nil {
 		t.Fatal("expected error for unknown flag --bogus")
 	}
 	if !strings.Contains(err.Error(), "--bogus") {
 		t.Errorf("error should mention the unknown flag, got: %v", err)
+	}
+}
+
+func TestParseStartArgs_LabelFlag(t *testing.T) {
+	_, _, label, err := parseStartArgs([]string{"--label=my-session"})
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if label != "my-session" {
+		t.Errorf("expected label 'my-session', got %q", label)
+	}
+}
+
+func TestParseStartArgs_LabelFlagSeparate(t *testing.T) {
+	_, _, label, err := parseStartArgs([]string{"--label", "my-session"})
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if label != "my-session" {
+		t.Errorf("expected label 'my-session', got %q", label)
+	}
+}
+
+func TestParseStartArgs_LabelWithOtherFlags(t *testing.T) {
+	insecure, headless, label, err := parseStartArgs([]string{"--show", "--label=test", "--insecure"})
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if !insecure {
+		t.Error("expected insecure=true")
+	}
+	if headless {
+		t.Error("expected headless=false")
+	}
+	if label != "test" {
+		t.Errorf("expected label 'test', got %q", label)
+	}
+}
+
+func TestStateLabelSerialization(t *testing.T) {
+	s := &State{
+		DebugURL:   "ws://127.0.0.1:9222",
+		ChromePID:  12345,
+		ActivePage: 0,
+		DataDir:    "/tmp/test",
+		Label:      "my-label",
+	}
+	data, err := json.Marshal(s)
+	if err != nil {
+		t.Fatalf("marshal failed: %v", err)
+	}
+	var loaded State
+	if err := json.Unmarshal(data, &loaded); err != nil {
+		t.Fatalf("unmarshal failed: %v", err)
+	}
+	if loaded.Label != "my-label" {
+		t.Errorf("expected label 'my-label', got %q", loaded.Label)
+	}
+}
+
+func TestStateLabelOmittedWhenEmpty(t *testing.T) {
+	s := &State{
+		DebugURL:   "ws://127.0.0.1:9222",
+		ChromePID:  12345,
+		ActivePage: 0,
+		DataDir:    "/tmp/test",
+	}
+	data, err := json.Marshal(s)
+	if err != nil {
+		t.Fatalf("marshal failed: %v", err)
+	}
+	if strings.Contains(string(data), "label") {
+		t.Errorf("label should be omitted when empty, got: %s", data)
+	}
+}
+
+func TestDiscoverInstances_FindsTempDirs(t *testing.T) {
+	dir := t.TempDir()
+	stateFile := filepath.Join(dir, "state.json")
+	data := `{"debug_url":"ws://127.0.0.1:9222","chrome_pid":99999,"active_page":0,"data_dir":"/tmp","label":"test-discover"}`
+	os.WriteFile(stateFile, []byte(data), 0644)
+
+	// Set RODNEY_HOME to point to our temp dir
+	t.Setenv("RODNEY_HOME", dir)
+
+	entries := discoverInstances()
+	found := false
+	for _, e := range entries {
+		if e.Dir == dir && e.State.Label == "test-discover" {
+			found = true
+			if e.Alive {
+				t.Error("expected dead instance (pid 99999 should not exist)")
+			}
+		}
+	}
+	if !found {
+		t.Errorf("expected to discover instance in %s", dir)
 	}
 }
 

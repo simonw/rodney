@@ -1,10 +1,16 @@
 rodney - Chrome automation from the command line
 
 Browser lifecycle:
-  rodney start [--show] [--insecure | -k]  Launch Chrome (headless by default, --show for visible)
+  rodney start [--show] [--insecure | -k] [--label=NAME]
+                                  Launch Chrome (headless by default, --show for visible)
   rodney connect <host:port>      Connect to existing Chrome on remote debug port
   rodney stop                     Shut down Chrome
   rodney status                   Show browser status
+
+Instance management:
+  rodney list                     List all discovered rodney instances
+  rodney cleanup                  Remove stale state for dead instances
+  rodney cleanup --all            Stop all instances and remove state
 
 Navigation:
   rodney open <url>               Navigate to URL
