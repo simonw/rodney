@@ -1,0 +1,24 @@
+name: Semgrep
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+  schedule:
+    - cron: "0 6 * * 1"
+
+permissions:
+  contents: read
+  security-events: write
+
+jobs:
+  semgrep:
+    name: semgrep
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd
+      - run: pipx run semgrep scan --config p/default --config p/secrets --sarif --output semgrep.sarif
+      - uses: github/codeql-action/upload-sarif@84498526a009a99c875e83ef4821a8ba52de7c22
+        if: always()
+        with:
+          sarif_file: semgrep.sarif

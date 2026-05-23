@@ -1,6 +1,8 @@
 package main
 
 import (
+	"bufio"
+	stdctx "context"
 	_ "embed"
 	"encoding/base64"
 	"encoding/json"
@@ -14,8 +16,10 @@ import (
 	"os/exec"
 	"os/signal"
 	"path/filepath"
+	"runtime"
 	"strconv"
 	"strings"
+	"sync"
 	"syscall"
 	"time"
 
@@ -77,14 +81,36 @@ func resolveStateDir(mode scopeMode, workingDir string) string {
 	}
 }
 
+// CallRecord tracks a single command invocation for repeated-failure detection.
+type CallRecord struct {
+	Cmd      string `json:"cmd"`
+	Selector string `json:"sel,omitempty"`
+	OK       bool   `json:"ok"`
+	Error    string `json:"err,omitempty"`
+	TS       int64  `json:"ts"`
+}
+
 // State persisted between CLI invocations
 type State struct {
 	DebugURL    string `json:"debug_url"`
 	ChromePID   int    `json:"chrome_pid"`
 	ActivePage  int    `json:"active_page"`  // index into pages list
 	DataDir     string `json:"data_dir"`
-	ProxyPID    int    `json:"proxy_pid,omitempty"`  // PID of auth proxy helper
-	ProxyPort   int    `json:"proxy_port,omitempty"` // local port of auth proxy
+	ProxyPID    int    `json:"proxy_pid,omitempty"`   // PID of auth proxy helper
+	ProxyPort   int    `json:"proxy_port,omitempty"`  // local port of auth proxy
+	Logs        bool   `json:"logs,omitempty"`        // console log capture enabled
+	LoggerPID   int    `json:"logger_pid,omitempty"`  // PID of _logger subprocess
+
+	Stealth bool `json:"stealth,omitempty"` // stealth mode: remove automation fingerprints
+
+	// Viewport overrides (set by "rodney viewport", re-applied on each connection)
+	ViewportWidth  int     `json:"viewport_width,omitempty"`
+	ViewportHeight int     `json:"viewport_height,omitempty"`
+	ViewportScale  float64 `json:"viewport_scale,omitempty"`
+	ViewportMobile bool    `json:"viewport_mobile,omitempty"`
+
+	// Ring buffer of recent command results for repeated-failure detection
+	RecentCalls []CallRecord `json:"recent_calls,omitempty"`
 }
 
 func stateDir() string {
@@ -163,6 +189,266 @@ func fatal(format string, args ...interface{}) {
 	os.Exit(2)
 }
 
+func hint(format string, args ...interface{}) {
+	fmt.Fprintf(os.Stderr, "hint: "+format+"\n", args...)
+}
+
+// isGVisor reports whether the current process is running under gVisor.
+// Chrome's multi-process compositor hangs under gVisor's seccomp+ptrace
+// syscall interception, so screenshots require --single-process there.
+// Detection reads /proc/version, which gVisor populates with a signature
+// like "Linux version 4.4.0 ... #1 SMP Sun Jan 10 15:06:54 PST 2016".
+// The reliable marker is the kernel release string "gvisor" shown by
+// uname -a under runsc. Returns false on non-Linux.
+func isGVisor() bool {
+	if runtime.GOOS != "linux" {
+		return false
+	}
+	data, err := os.ReadFile("/proc/version")
+	if err != nil {
+		return false
+	}
+	return strings.Contains(strings.ToLower(string(data)), "gvisor")
+}
+
+// context writes a contextual hint to stderr to help agents self-correct.
+func context(format string, args ...interface{}) {
+	fmt.Fprintf(os.Stderr, "context: "+format+"\n", args...)
+}
+
+// inspectFailure runs a single JavaScript snippet on the page to gather context
+// about why an element operation failed. It writes findings as context: lines to
+// stderr. It must not panic or fatal if the inspection itself fails.
+func inspectFailure(page *rod.Page, selector string) {
+	// Budget 200ms for the entire inspection
+	ctx, cancel := stdctx.WithTimeout(stdctx.Background(), 200*time.Millisecond)
+	defer cancel()
+	shortPage := page.Context(ctx)
+
+	jsSnippet := fmt.Sprintf(`() => {
+  var selector = %q;
+  var result = {};
+  result.readyState = document.readyState;
+  result.url = location.href;
+  result.title = document.title;
+
+  // Check if selector matches but is hidden
+  try {
+    var el = document.querySelector(selector);
+    if (el) {
+      var style = getComputedStyle(el);
+      var rect = el.getBoundingClientRect();
+      result.hidden = {
+        display: style.display,
+        visibility: style.visibility,
+        opacity: style.opacity,
+        width: rect.width,
+        height: rect.height
+      };
+    }
+  } catch(e) {}
+
+  // Find similar interactive elements
+  try {
+    var interactive = document.querySelectorAll(
+      'button, a[href], input, select, textarea, [role="button"], [role="link"], [tabindex]'
+    );
+    result.available = Array.from(interactive).slice(0, 20).map(function(el) {
+      return {
+        tag: el.tagName.toLowerCase(),
+        id: el.id || '',
+        classes: el.className || '',
+        text: (el.textContent || '').trim().slice(0, 50),
+        type: el.type || '',
+        name: el.name || ''
+      };
+    });
+  } catch(e) { result.available = []; }
+
+  // Check for overlay at center of viewport
+  try {
+    var cx = window.innerWidth / 2, cy = window.innerHeight / 2;
+    var topEl = document.elementFromPoint(cx, cy);
+    if (topEl) {
+      var tz = getComputedStyle(topEl).zIndex;
+      if (tz !== 'auto' && parseInt(tz) > 100) {
+        result.overlay = {
+          tag: topEl.tagName.toLowerCase(),
+          id: topEl.id || '',
+          classes: topEl.className || '',
+          zIndex: tz
+        };
+      }
+    }
+  } catch(e) {}
+
+  // Check for auth patterns in URL
+  result.authPattern = /login|signin|sign-in|auth|sso|oauth/i.test(location.href) ||
+                       /login|sign.in/i.test(document.title);
+
+  return JSON.stringify(result);
+}`, selector)
+
+	result, err := shortPage.Eval(jsSnippet)
+	if err != nil {
+		return
+	}
+
+	raw := result.Value.Str()
+	if raw == "" {
+		return
+	}
+
+	var data struct {
+		ReadyState  string `json:"readyState"`
+		URL         string `json:"url"`
+		Title       string `json:"title"`
+		AuthPattern bool   `json:"authPattern"`
+		Hidden      *struct {
+			Display    string  `json:"display"`
+			Visibility string  `json:"visibility"`
+			Opacity    string  `json:"opacity"`
+			Width      float64 `json:"width"`
+			Height     float64 `json:"height"`
+		} `json:"hidden"`
+		Available []struct {
+			Tag     string `json:"tag"`
+			ID      string `json:"id"`
+			Classes string `json:"classes"`
+			Text    string `json:"text"`
+			Type    string `json:"type"`
+			Name    string `json:"name"`
+		} `json:"available"`
+		Overlay *struct {
+			Tag     string `json:"tag"`
+			ID      string `json:"id"`
+			Classes string `json:"classes"`
+			ZIndex  string `json:"zIndex"`
+		} `json:"overlay"`
+	}
+
+	if err := json.Unmarshal([]byte(raw), &data); err != nil {
+		return
+	}
+
+	// Hidden element detection
+	if data.Hidden != nil {
+		if data.Hidden.Display == "none" {
+			context("'%s' exists but is hidden (display: none) — try 'rodney wait \"%s\"'", selector, selector)
+		} else if data.Hidden.Visibility == "hidden" {
+			context("'%s' exists but is hidden (visibility: hidden) — try 'rodney wait \"%s\"'", selector, selector)
+		} else if data.Hidden.Opacity == "0" {
+			context("'%s' exists but is hidden (opacity: 0) — try 'rodney wait \"%s\"'", selector, selector)
+		} else if data.Hidden.Width == 0 && data.Hidden.Height == 0 {
+			context("'%s' exists but is hidden (zero dimensions) — try 'rodney wait \"%s\"'", selector, selector)
+		}
+	}
+
+	// Page still loading
+	if data.ReadyState != "complete" {
+		context("page is still loading (readyState: %s) — try 'rodney waitstable'", data.ReadyState)
+	}
+
+	// Auth redirect detection
+	if data.AuthPattern {
+		context("current URL appears to be a login page (%s)", data.URL)
+	}
+
+	// Overlay detection
+	if data.Overlay != nil {
+		overlayDesc := data.Overlay.Tag
+		if data.Overlay.Classes != "" {
+			overlayDesc += "." + strings.SplitN(data.Overlay.Classes, " ", 2)[0]
+		}
+		context("a modal/overlay may be blocking the page (%s, z-index: %s)", overlayDesc, data.Overlay.ZIndex)
+	}
+
+	// Fuzzy matching on available elements
+	if len(data.Available) > 0 {
+		matched := false
+		if strings.HasPrefix(selector, "#") {
+			target := strings.TrimPrefix(selector, "#")
+			for _, el := range data.Available {
+				if el.ID != "" && el.ID != target && strings.Contains(el.ID, target) {
+					context("did you mean '#%s'?", el.ID)
+					matched = true
+				}
+			}
+		}
+		if !matched {
+			context("page has %d interactive elements — try 'rodney discover --interactive'", len(data.Available))
+		}
+	}
+}
+
+// observationCmds lists commands that don't break failure streaks.
+var observationCmds = map[string]bool{
+	"url": true, "title": true, "text": true, "html": true,
+	"screenshot": true, "screenshot-el": true, "exists": true,
+	"visible": true, "count": true, "ax-tree": true, "ax-find": true,
+	"ax-node": true, "discover": true, "pages": true, "status": true,
+	"logs": true, "pdf": true, "attr": true,
+}
+
+// recordCall appends a CallRecord to state and trims to the last 10 entries.
+func recordCall(cmd, selector string, ok bool, errMsg string) {
+	s, err := loadState()
+	if err != nil {
+		return
+	}
+	s.RecentCalls = append(s.RecentCalls, CallRecord{
+		Cmd:      cmd,
+		Selector: selector,
+		OK:       ok,
+		Error:    errMsg,
+		TS:       time.Now().Unix(),
+	})
+	if len(s.RecentCalls) > 10 {
+		s.RecentCalls = s.RecentCalls[len(s.RecentCalls)-10:]
+	}
+	_ = saveState(s)
+}
+
+// checkStuck walks RecentCalls backwards counting consecutive identical failures.
+func checkStuck(cmd, selector string) int {
+	s, err := loadState()
+	if err != nil {
+		return 0
+	}
+	count := 0
+	for i := len(s.RecentCalls) - 1; i >= 0; i-- {
+		r := s.RecentCalls[i]
+		if observationCmds[r.Cmd] {
+			continue
+		}
+		if r.OK {
+			break
+		}
+		if r.Cmd == cmd && r.Selector == selector {
+			count++
+		} else {
+			break
+		}
+	}
+	return count
+}
+
+// reportStuck writes escalating context to stderr based on failure count.
+func reportStuck(count int) {
+	if count <= 1 {
+		return
+	}
+	if count == 2 {
+		context("this command has failed %d times with the same error — try a different selector", count)
+		return
+	}
+	context("STUCK — this command has failed %d times in a row", count)
+	context("stop retrying and try a different approach:")
+	context("  rodney discover --interactive")
+	context("  rodney ax-find --role button")
+	context("  rodney waitstable")
+}
+
 // findUnknownFlag returns the first arg not registered in fs, preserving original form (e.g. --bogus).
 func findUnknownFlag(args []string, fs *flag.FlagSet) string {
 	for _, a := range args {
@@ -207,6 +493,8 @@ func main() {
 	switch cmd {
 	case "_proxy":
 		cmdInternalProxy(args) // hidden: runs the auth proxy helper
+	case "_logger":
+		cmdInternalLogger(args) // hidden: runs the browser console logger
 	case "start":
 		cmdStart(args)
 	case "connect":
@@ -271,6 +559,8 @@ func main() {
 		cmdScreenshot(args)
 	case "screenshot-el":
 		cmdScreenshotEl(args)
+	case "viewport":
+		cmdViewport(args)
 	case "pages":
 		cmdPages(args)
 	case "page":
@@ -287,12 +577,18 @@ func main() {
 		cmdVisible(args)
 	case "assert":
 		cmdAssert(args)
+	case "logs":
+		cmdLogs(args)
 	case "ax-tree":
 		cmdAXTree(args)
 	case "ax-find":
 		cmdAXFind(args)
 	case "ax-node":
 		cmdAXNode(args)
+	case "discover":
+		cmdDiscover(args)
+	case "check":
+		cmdCheck(args)
 	case "help", "-h", "--help":
 		printUsage()
 		os.Exit(0)
@@ -331,34 +627,158 @@ func withPage() (*State, *rod.Browser, *rod.Page) {
 	}
 	// Apply default timeout so element queries don't hang forever
 	page = page.Timeout(defaultTimeout)
+
+	// Re-apply viewport override if set via "rodney viewport"
+	if s.ViewportWidth > 0 && s.ViewportHeight > 0 {
+		scale := s.ViewportScale
+		if scale == 0 {
+			scale = 1
+		}
+		if err := (proto.EmulationSetDeviceMetricsOverride{
+			Width:             s.ViewportWidth,
+			Height:            s.ViewportHeight,
+			DeviceScaleFactor: scale,
+			Mobile:            s.ViewportMobile,
+		}.Call(page)); err != nil {
+			fmt.Fprintf(os.Stderr, "warning: failed to re-apply viewport: %v\n", err)
+		}
+	}
+
+	// Inject stealth script to hide automation fingerprints
+	if s.Stealth {
+		_, _ = proto.PageAddScriptToEvaluateOnNewDocument{
+			Source: `Object.defineProperty(navigator, 'webdriver', {get: () => false});`,
+		}.Call(page)
+	}
+
 	return s, browser, page
+}
+
+// formatViewportDesc returns a human-readable description of viewport settings.
+func formatViewportDesc(prefix string, w, h int, mobile bool, scale float64) string {
+	desc := fmt.Sprintf("%s %dx%d", prefix, w, h)
+	var extras []string
+	if mobile {
+		extras = append(extras, "mobile")
+	}
+	if scale != 0 && scale != 1 {
+		extras = append(extras, fmt.Sprintf("scale %g", scale))
+	}
+	if len(extras) > 0 {
+		desc += " (" + strings.Join(extras, ", ") + ")"
+	}
+	return desc
 }
 
 // --- Commands ---
 
-// parseStartArgs parses the flags for the "start" command.
-// Returns ignoreCertErrors, headless, and an error for unknown flags.
-func parseStartArgs(args []string) (ignoreCertErrors bool, headless bool, err error) {
+type startFlags struct {
+	headless         bool
+	ignoreCertErrors bool
+	enableLogs       bool
+	fakeMedia        bool
+	stealth          bool
+	singleProcess    string // "auto" (default), "on", "off"
+	vpWidth          int
+	vpHeight         int
+	vpScale          float64
+	vpMobile         bool
+}
+
+// parseStartFlags parses the arguments to "rodney start" using flag.FlagSet.
+func parseStartFlags(args []string) (startFlags, error) {
+	// Pre-extract --viewport WxH since flag.FlagSet can't handle that format
+	var vpArg string
+	var filtered []string
+	for i := 0; i < len(args); i++ {
+		if args[i] == "--viewport" {
+			i++
+			if i >= len(args) {
+				return startFlags{}, fmt.Errorf("missing value for --viewport (expected WxH, e.g. 375x812)")
+			}
+			vpArg = args[i]
+		} else {
+			filtered = append(filtered, args[i])
+		}
+	}
+
 	fs := flag.NewFlagSet("start", flag.ContinueOnError)
 	fs.SetOutput(io.Discard)
-	fs.BoolVar(&ignoreCertErrors, "insecure", false, "")
-	fs.BoolVar(&ignoreCertErrors, "k", false, "")
 	show := fs.Bool("show", false, "")
+	insecure := fs.Bool("insecure", false, "")
+	k := fs.Bool("k", false, "")
+	logs := fs.Bool("logs", false, "")
+	fakeMedia := fs.Bool("fake-media", false, "")
+	stealth := fs.Bool("stealth", false, "")
+	mobile := fs.Bool("mobile", false, "")
+	scale := fs.Float64("scale", 0, "")
+	singleProcess := fs.String("single-process", "auto", "")
 
-	if parseErr := fs.Parse(args); parseErr != nil {
-		return false, true, fmt.Errorf("unknown flag: %s\nusage: rodney start [--show] [--insecure]", findUnknownFlag(args, fs))
+	usage := "usage: rodney start [--show] [--insecure | -k] [--logs] [--fake-media] [--stealth] [--single-process auto|on|off] [--viewport WxH] [--mobile] [--scale N]"
+
+	if err := fs.Parse(filtered); err != nil {
+		return startFlags{}, fmt.Errorf("unknown flag: %s\n%s", findUnknownFlag(filtered, fs), usage)
 	}
 	if fs.NArg() > 0 {
-		return false, true, fmt.Errorf("unknown flag: %s\nusage: rodney start [--show] [--insecure]", fs.Arg(0))
+		return startFlags{}, fmt.Errorf("unknown flag: %s\n%s", fs.Arg(0), usage)
 	}
-	headless = !*show
-	return ignoreCertErrors, headless, nil
+
+	switch *singleProcess {
+	case "auto", "on", "off":
+	default:
+		return startFlags{}, fmt.Errorf("invalid --single-process value %q (expected auto, on, or off)", *singleProcess)
+	}
+
+	f := startFlags{
+		headless:         !*show,
+		ignoreCertErrors: *insecure || *k,
+		enableLogs:       *logs,
+		fakeMedia:        *fakeMedia,
+		stealth:          *stealth,
+		singleProcess:    *singleProcess,
+		vpMobile:         *mobile,
+		vpScale:          *scale,
+	}
+
+	if vpArg != "" {
+		parts := strings.SplitN(vpArg, "x", 2)
+		if len(parts) != 2 {
+			return f, fmt.Errorf("invalid viewport format: %q (expected WxH, e.g. 375x812)", vpArg)
+		}
+		w, err := strconv.Atoi(parts[0])
+		if err != nil {
+			return f, fmt.Errorf("invalid viewport width: %v", err)
+		}
+		h, err := strconv.Atoi(parts[1])
+		if err != nil {
+			return f, fmt.Errorf("invalid viewport height: %v", err)
+		}
+		f.vpWidth, f.vpHeight = w, h
+	}
+
+	return f, nil
 }
 
 func cmdStart(args []string) {
-	ignoreCertErrors, headless, err := parseStartArgs(args)
+	flags, err := parseStartFlags(args)
 	if err != nil {
 		fatal("%s", err)
+	}
+	ignoreCertErrors := flags.ignoreCertErrors
+	enableLogs := flags.enableLogs
+	fakeMedia := flags.fakeMedia
+	stealth := flags.stealth
+	headless := flags.headless
+	vpWidth, vpHeight := flags.vpWidth, flags.vpHeight
+	vpScale := flags.vpScale
+	vpMobile := flags.vpMobile
+
+	if (vpMobile || vpScale != 0) && vpWidth == 0 {
+		fatal("--mobile and --scale require --viewport")
+	}
+
+	if vpWidth > 0 && vpScale == 0 {
+		vpScale = 1
 	}
 
 	// Check if already running
@@ -377,10 +797,25 @@ func cmdStart(args []string) {
 	l := launcher.New().
 		Set("no-sandbox").
 		Set("disable-gpu").
-		Set("single-process"). // Required for screenshots in gVisor/container environments
-		Leakless(false).        // Keep Chrome alive after CLI exits
+		Leakless(false). // Keep Chrome alive after CLI exits
 		UserDataDir(dataDir).
 		Headless(headless)
+
+	// --single-process is required for screenshots under gVisor (its seccomp
+	// shim breaks Chrome's multi-process compositor) but causes frequent
+	// crashes on desktop. Auto-detect gVisor; allow explicit override.
+	useSingleProcess := false
+	switch flags.singleProcess {
+	case "on":
+		useSingleProcess = true
+	case "off":
+		useSingleProcess = false
+	default: // "auto"
+		useSingleProcess = isGVisor()
+	}
+	if useSingleProcess {
+		l = l.Set("single-process")
+	}
 
 	// When in non-headless mode, make sure that we show the startup window immediately
 	// (instead of showing a window only after calling "rodney open")
@@ -388,8 +823,21 @@ func cmdStart(args []string) {
 		l = l.Delete("no-startup-window")
 	}
 
+	if stealth {
+		l = l.Set("disable-blink-features", "AutomationControlled")
+		l = l.Delete("enable-automation")
+	}
+
 	if bin := os.Getenv("ROD_CHROME_BIN"); bin != "" {
 		l = l.Bin(bin)
+	} else if runtime.GOOS != "darwin" {
+		// On macOS, Google Chrome.app enforces single-instance per bundle, so
+		// launching it while the user's regular Chrome is running causes the
+		// new process to be absorbed and exit. Prefer go-rod's auto-downloaded
+		// Chromium there. On other platforms, reuse system Chrome/Chromium.
+		if found, ok := launcher.LookPath(); ok {
+			l = l.Bin(found)
+		}
 	}
 
 	// Detect authenticated proxy and launch helper if needed
@@ -407,6 +855,7 @@ func cmdStart(args []string) {
 
 		// Launch ourselves as the proxy helper in the background
 		exe, _ := os.Executable()
+		// nosemgrep: go.lang.security.audit.dangerous-exec-command -- exe is os.Executable() (our own binary); no shell, args are a literal subcommand, a locally-bound port, and operator HTTP(S)_PROXY config — not attacker input.
 		cmd := exec.Command(exe, "_proxy",
 			strconv.Itoa(proxyPort), server, authHeader)
 		setSysProcAttr(cmd)
@@ -429,18 +878,47 @@ func cmdStart(args []string) {
 		l.Set("ignore-certificate-errors")
 	}
 
+	if fakeMedia {
+		l.Set("use-fake-device-for-media-stream")
+		l.Set("use-fake-ui-for-media-stream")
+	}
+
 	debugURL := l.MustLaunch()
 
 	// Get Chrome PID from the launcher
 	pid := l.PID()
 
+	// Launch logger subprocess if --logs was specified
+	var loggerPID int
+	if enableLogs {
+		logsDir := filepath.Join(stateDir(), "logs")
+		os.MkdirAll(logsDir, 0755)
+		exe, _ := os.Executable()
+		// nosemgrep: go.lang.security.audit.dangerous-exec-command -- exe is os.Executable() (our own binary); no shell, args are a literal subcommand, the locally-generated DevTools URL, and our own state dir — not attacker input.
+		cmd := exec.Command(exe, "_logger", debugURL, logsDir)
+		setSysProcAttr(cmd)
+		if err := cmd.Start(); err != nil {
+			fatal("failed to start logger: %v", err)
+		}
+		loggerPID = cmd.Process.Pid
+		cmd.Process.Release()
+		fmt.Printf("Logger started (PID %d)\n", loggerPID)
+	}
+
 	state := &State{
-		DebugURL:   debugURL,
-		ChromePID:  pid,
-		ActivePage: 0,
-		DataDir:    dataDir,
-		ProxyPID:   proxyPID,
-		ProxyPort:  proxyPort,
+		DebugURL:       debugURL,
+		ChromePID:      pid,
+		ActivePage:     0,
+		DataDir:        dataDir,
+		ProxyPID:       proxyPID,
+		ProxyPort:      proxyPort,
+		Logs:           enableLogs,
+		LoggerPID:      loggerPID,
+		Stealth:        stealth,
+		ViewportWidth:  vpWidth,
+		ViewportHeight: vpHeight,
+		ViewportScale:  vpScale,
+		ViewportMobile: vpMobile,
 	}
 
 	if err := saveState(state); err != nil {
@@ -449,6 +927,9 @@ func cmdStart(args []string) {
 
 	fmt.Printf("Chrome started (PID %d)\n", pid)
 	fmt.Printf("Debug URL: %s\n", debugURL)
+	if vpWidth > 0 && vpHeight > 0 {
+		fmt.Println(formatViewportDesc("Viewport:", vpWidth, vpHeight, vpMobile, vpScale))
+	}
 }
 
 func cmdConnect(args []string) {
@@ -522,6 +1003,12 @@ func cmdStop(args []string) {
 			proc.Signal(syscall.SIGTERM)
 		}
 	}
+	// Kill the logger subprocess if running
+	if s.LoggerPID > 0 {
+		if proc, err := os.FindProcess(s.LoggerPID); err == nil {
+			proc.Signal(syscall.SIGTERM)
+		}
+	}
 	removeState()
 	fmt.Println("Chrome stopped")
 }
@@ -573,7 +1060,20 @@ func cmdOpen(args []string) {
 	pages, _ := browser.Pages()
 	var page *rod.Page
 	if len(pages) == 0 {
-		page = browser.MustPage(url)
+		if s.Logs {
+			// Create a blank page first so _logger receives TargetTargetCreated and
+			// calls RuntimeEnable before any scripts execute. RuntimeEnable persists
+			// across same-target navigations, so inline scripts on the real URL are
+			// captured. Poll for the log file: trackPage creates it only after
+			// RuntimeEnable returns, so its existence is an exact ready signal.
+			page = browser.MustPage("")
+			waitForLogger(page)
+			if err := page.Navigate(url); err != nil {
+				fatal("navigation failed: %v", err)
+			}
+		} else {
+			page = browser.MustPage(url)
+		}
 		s.ActivePage = 0
 		saveState(s)
 	} else {
@@ -663,6 +1163,7 @@ func cmdHTML(args []string) {
 	if len(args) > 0 {
 		el, err := page.Element(args[0])
 		if err != nil {
+			hint("try 'rodney discover --interactive' to see available elements")
 			fatal("element not found: %v", err)
 		}
 		html, err := el.HTML()
@@ -683,6 +1184,7 @@ func cmdText(args []string) {
 	_, _, page := withPage()
 	el, err := page.Element(args[0])
 	if err != nil {
+		hint("try 'rodney discover --interactive' to see available elements")
 		fatal("element not found: %v", err)
 	}
 	text, err := el.Text()
@@ -699,6 +1201,7 @@ func cmdAttr(args []string) {
 	_, _, page := withPage()
 	el, err := page.Element(args[0])
 	if err != nil {
+		hint("try 'rodney discover --interactive' to see available elements")
 		fatal("element not found: %v", err)
 	}
 	val := el.MustAttribute(args[1])
@@ -737,10 +1240,25 @@ func cmdPDF(args []string) {
 }
 
 func cmdJS(args []string) {
-	if len(args) < 1 {
-		fatal("usage: rodney js <expression>")
+	var expr string
+	if len(args) == 0 || (len(args) == 1 && args[0] == "-") {
+		if len(args) == 0 {
+			// Only read from stdin automatically if it's piped (not a terminal)
+			if stat, err := os.Stdin.Stat(); err != nil || (stat.Mode()&os.ModeCharDevice) != 0 {
+				fatal("usage: rodney js <expression>")
+			}
+		}
+		data, err := io.ReadAll(os.Stdin)
+		if err != nil {
+			fatal("failed to read stdin: %v", err)
+		}
+		expr = strings.TrimSpace(string(data))
+		if expr == "" {
+			fatal("empty expression from stdin")
+		}
+	} else {
+		expr = strings.Join(args, " ")
 	}
-	expr := strings.Join(args, " ")
 	_, _, page := withPage()
 
 	// Wrap bare expressions in a function
@@ -770,18 +1288,111 @@ func cmdJS(args []string) {
 	}
 }
 
+// parseAXFlags scans args for --role and --name flags, removes them, and returns
+// the remaining args along with the extracted role and name values.
+func parseAXFlags(args []string) (role, name string, remaining []string) {
+	for i := 0; i < len(args); i++ {
+		switch args[i] {
+		case "--role":
+			i++
+			if i < len(args) {
+				role = args[i]
+			}
+		case "--name":
+			i++
+			if i < len(args) {
+				name = args[i]
+			}
+		default:
+			remaining = append(remaining, args[i])
+		}
+	}
+	return
+}
+
+// resolveElement parses args for either a positional CSS selector OR --role/--name
+// flags, finds the element on the page, and returns: the element, a human-readable
+// selector description (for error messages), and the remaining (non-selector) args.
+//
+// When --role/--name flags are present, the first remaining arg is NOT consumed as
+// a CSS selector; all remaining args are returned as-is for the caller to use.
+// When no --role/--name flags are present, the first remaining arg is consumed as
+// the CSS selector, and subsequent remaining args are returned.
+//
+// It calls fatal() if both a CSS selector and --role/--name are provided, or if no
+// element is found.
+func resolveElement(page *rod.Page, args []string) (*rod.Element, string, []string) {
+	role, name, remaining := parseAXFlags(args)
+	hasAX := role != "" || name != ""
+
+	if !hasAX {
+		// CSS selector mode: first remaining arg is the selector
+		if len(remaining) == 0 {
+			fatal("must provide either a CSS selector or --role/--name flags")
+		}
+		selector := remaining[0]
+		el, err := page.Element(selector)
+		if err != nil {
+			inspectFailure(page, selector)
+			hint("try 'rodney discover --interactive' to see available elements")
+			fatal("element not found: %v", err)
+		}
+		return el, selector, remaining[1:]
+	}
+
+	// Accessibility selector path — remaining args are passed through to the caller
+	desc := ""
+	if role != "" && name != "" {
+		desc = fmt.Sprintf("--role %s --name %q", role, name)
+	} else if role != "" {
+		desc = fmt.Sprintf("--role %s", role)
+	} else {
+		desc = fmt.Sprintf("--name %q", name)
+	}
+
+	nodes, err := queryAXNodes(page, name, role)
+	if err != nil {
+		fatal("accessibility query failed: %v", err)
+	}
+	if len(nodes) == 0 {
+		inspectFailure(page, desc)
+		hint("try 'rodney ax-tree' to see all available accessibility nodes")
+		fatal("no element found matching %s", desc)
+	}
+
+	node := nodes[0]
+	if node.BackendDOMNodeID == 0 {
+		fatal("matched accessibility node has no DOM backing for %s", desc)
+	}
+
+	result, err := proto.DOMResolveNode{BackendNodeID: node.BackendDOMNodeID}.Call(page)
+	if err != nil {
+		fatal("failed to resolve DOM node for %s: %v", desc, err)
+	}
+	el, err := page.ElementFromObject(result.Object)
+	if err != nil {
+		fatal("failed to create element from object for %s: %v", desc, err)
+	}
+	return el, desc, remaining
+}
+
 func cmdClick(args []string) {
 	if len(args) < 1 {
-		fatal("usage: rodney click <selector>")
+		fatal("usage: rodney click <selector> | --role <role> [--name <name>]")
 	}
+	selector := args[0]
 	_, _, page := withPage()
-	el, err := page.Element(args[0])
-	if err != nil {
-		fatal("element not found: %v", err)
+	el, _, remaining := resolveElement(page, args)
+	if len(remaining) > 0 {
+		fatal("unexpected arguments after selector: %v", remaining)
 	}
 	if err := el.Click(proto.InputMouseButtonLeft, 1); err != nil {
+		reportStuck(checkStuck("click", selector))
+		recordCall("click", selector, false, fmt.Sprintf("%v", err))
+		hint("element may not be interactive — try 'rodney js \"document.querySelector(\\\"%s\\\").click()\"'", selector)
 		fatal("click failed: %v", err)
 	}
+	recordCall("click", selector, true, "")
 	// Brief pause for click handlers to execute
 	time.Sleep(100 * time.Millisecond)
 	fmt.Println("Clicked")
@@ -789,28 +1400,30 @@ func cmdClick(args []string) {
 
 func cmdInput(args []string) {
 	if len(args) < 2 {
-		fatal("usage: rodney input <selector> <text>")
+		fatal("usage: rodney input <selector> <text> | --role <role> [--name <name>] <text>")
 	}
 	_, _, page := withPage()
-	el, err := page.Element(args[0])
-	if err != nil {
-		fatal("element not found: %v", err)
+	el, _, remaining := resolveElement(page, args)
+	if len(remaining) == 0 {
+		fatal("usage: rodney input <selector> <text> | --role <role> [--name <name>] <text>")
 	}
-	text := strings.Join(args[1:], " ")
+	text := strings.Join(remaining, " ")
 	el.MustSelectAllText().MustInput(text)
+	recordCall("input", args[0], true, "")
 	fmt.Printf("Typed: %s\n", text)
 }
 
 func cmdClear(args []string) {
 	if len(args) < 1 {
-		fatal("usage: rodney clear <selector>")
+		fatal("usage: rodney clear <selector> | --role <role> [--name <name>]")
 	}
 	_, _, page := withPage()
-	el, err := page.Element(args[0])
-	if err != nil {
-		fatal("element not found: %v", err)
+	el, _, remaining := resolveElement(page, args)
+	if len(remaining) > 0 {
+		fatal("unexpected arguments after selector: %v", remaining)
 	}
 	el.MustSelectAllText().MustInput("")
+	recordCall("clear", args[0], true, "")
 	fmt.Println("Cleared")
 }
 
@@ -824,6 +1437,7 @@ func cmdFile(args []string) {
 	_, _, page := withPage()
 	el, err := page.Element(selector)
 	if err != nil {
+		hint("try 'rodney discover --interactive' to see available elements")
 		fatal("element not found: %v", err)
 	}
 
@@ -868,6 +1482,7 @@ func cmdDownload(args []string) {
 	_, _, page := withPage()
 	el, err := page.Element(selector)
 	if err != nil {
+		hint("try 'rodney discover --interactive' to see available elements")
 		fatal("element not found: %v", err)
 	}
 
@@ -1009,19 +1624,20 @@ func mimeToExt(mime string) string {
 
 func cmdSelect(args []string) {
 	if len(args) < 2 {
-		fatal("usage: rodney select <selector> <value>")
+		fatal("usage: rodney select <selector> <value> | --role <role> [--name <name>] <value>")
 	}
 	_, _, page := withPage()
-	// Use JavaScript to set the value, as rod's Select matches by text
-	js := fmt.Sprintf(`() => {
-		const el = document.querySelector(%q);
-		if (!el) throw new Error('element not found');
-		el.value = %q;
-		el.dispatchEvent(new Event('change', {bubbles: true}));
-		return el.value;
-	}`, args[0], args[1])
-	result, err := page.Eval(js)
+	el, _, remaining := resolveElement(page, args)
+	if len(remaining) == 0 {
+		fatal("usage: rodney select <selector> <value> | --role <role> [--name <name>] <value>")
+	}
+	value := remaining[0]
+	// Use JavaScript on the resolved element to set value and dispatch change event
+	result, err := el.Eval(`(val) => { this.value = val; this.dispatchEvent(new Event('change', {bubbles: true})); return this.value; }`, value)
 	if err != nil {
+		inspectFailure(page, args[0])
+		hint("try 'rodney discover --interactive' to see available elements")
+
 		fatal("select failed: %v", err)
 	}
 	fmt.Printf("Selected: %s\n", result.Value.Str())
@@ -1029,54 +1645,136 @@ func cmdSelect(args []string) {
 
 func cmdSubmit(args []string) {
 	if len(args) < 1 {
-		fatal("usage: rodney submit <selector>")
+		fatal("usage: rodney submit <selector> | --role <role> [--name <name>]")
 	}
 	_, _, page := withPage()
-	_, err := page.Element(args[0])
-	if err != nil {
-		fatal("form not found: %v", err)
+	el, _, remaining := resolveElement(page, args)
+	if len(remaining) > 0 {
+		fatal("unexpected arguments after selector: %v", remaining)
 	}
-	page.MustEval(fmt.Sprintf(`() => document.querySelector(%q).submit()`, args[0]))
+	_, err := el.Eval(`() => { this.submit(); }`)
+	if err != nil {
+		fatal("submit failed: %v", err)
+	}
 	fmt.Println("Submitted")
 }
 
 func cmdHover(args []string) {
 	if len(args) < 1 {
-		fatal("usage: rodney hover <selector>")
+		fatal("usage: rodney hover <selector> | --role <role> [--name <name>]")
 	}
 	_, _, page := withPage()
-	el, err := page.Element(args[0])
-	if err != nil {
-		fatal("element not found: %v", err)
+	el, _, remaining := resolveElement(page, args)
+	if len(remaining) > 0 {
+		fatal("unexpected arguments after selector: %v", remaining)
 	}
 	el.MustHover()
+	recordCall("hover", args[0], true, "")
 	fmt.Println("Hovered")
 }
 
 func cmdFocus(args []string) {
 	if len(args) < 1 {
-		fatal("usage: rodney focus <selector>")
+		fatal("usage: rodney focus <selector> | --role <role> [--name <name>]")
 	}
 	_, _, page := withPage()
-	el, err := page.Element(args[0])
-	if err != nil {
-		fatal("element not found: %v", err)
+	el, _, remaining := resolveElement(page, args)
+	if len(remaining) > 0 {
+		fatal("unexpected arguments after selector: %v", remaining)
 	}
 	el.MustFocus()
+	recordCall("focus", args[0], true, "")
 	fmt.Println("Focused")
+}
+
+// parseWaitArgs extracts --text <value> and --gone flags from args,
+// returning the selector and option values.
+func parseWaitArgs(args []string) (selector string, textMatch string, gone bool) {
+	var positional []string
+	for i := 0; i < len(args); i++ {
+		switch args[i] {
+		case "--text":
+			if i+1 >= len(args) {
+				fatal("--text requires a value")
+			}
+			i++
+			textMatch = args[i]
+		case "--gone":
+			gone = true
+		default:
+			positional = append(positional, args[i])
+		}
+	}
+	if len(positional) != 1 {
+		fatal("usage: rodney wait <selector> [--text <value>] [--gone]")
+	}
+	selector = positional[0]
+	return
 }
 
 func cmdWait(args []string) {
 	if len(args) < 1 {
-		fatal("usage: rodney wait <selector>")
+		fatal("usage: rodney wait <selector> [--text <value>] [--gone] | --role <role> [--name <name>]")
 	}
+
+	selector, textMatch, gone := parseWaitArgs(args)
+
+	if textMatch != "" && gone {
+		fatal("--text and --gone are mutually exclusive")
+	}
+
 	_, _, page := withPage()
-	el, err := page.Element(args[0])
-	if err != nil {
-		fatal("element not found: %v", err)
+
+	if gone {
+		// Wait for element to disappear from DOM or become hidden
+		deadline := time.Now().Add(defaultTimeout)
+		for time.Now().Before(deadline) {
+			els, err := page.Elements(selector)
+			if err != nil || len(els) == 0 {
+				fmt.Println("Element gone")
+				return
+			}
+			allHidden := true
+			for _, el := range els {
+				visible, err := el.Visible()
+				if err == nil && visible {
+					allHidden = false
+					break
+				}
+			}
+			if allHidden {
+				fmt.Println("Element gone")
+				return
+			}
+			time.Sleep(100 * time.Millisecond)
+		}
+		fatal("timeout waiting for element to disappear: %s", selector)
+		return
 	}
+
+	if textMatch != "" {
+		// Wait for element to exist and contain the specified text
+		deadline := time.Now().Add(defaultTimeout)
+		for time.Now().Before(deadline) {
+			el, err := page.Element(selector)
+			if err == nil {
+				text, err := el.Text()
+				if err == nil && strings.Contains(text, textMatch) {
+					fmt.Println("Found")
+					return
+				}
+			}
+			time.Sleep(100 * time.Millisecond)
+		}
+		hint("page may still be loading — try 'rodney waitstable' before this command")
+		fatal("timeout waiting for text %q in %s", textMatch, selector)
+		return
+	}
+
+	// Default: wait for element to exist and be visible (supports --role/--name)
+	el, _, _ := resolveElement(page, args)
 	el.MustWaitVisible()
-	fmt.Println("Element visible")
+	fmt.Println("Found")
 }
 
 func cmdWaitLoad(args []string) {
@@ -1123,11 +1821,95 @@ func nextAvailableFile(base, ext string) string {
 	}
 }
 
+func cmdViewport(args []string) {
+	if len(args) < 1 {
+		fatal("usage: rodney viewport <width> <height> [--scale N] [--mobile]\n       rodney viewport --reset")
+	}
+
+	// Handle --reset: clear viewport override and restore browser defaults
+	if args[0] == "--reset" {
+		s, _, page := withPage()
+
+		if err := (proto.EmulationClearDeviceMetricsOverride{}.Call(page)); err != nil {
+			fatal("failed to clear viewport override: %v", err)
+		}
+
+		s.ViewportWidth = 0
+		s.ViewportHeight = 0
+		s.ViewportScale = 0
+		s.ViewportMobile = false
+		if err := saveState(s); err != nil {
+			fatal("failed to save state: %v", err)
+		}
+
+		fmt.Println("Viewport reset to browser default")
+		return
+	}
+
+	if len(args) < 2 {
+		fatal("usage: rodney viewport <width> <height> [--scale N] [--mobile]\n       rodney viewport --reset")
+	}
+
+	w, err := strconv.Atoi(args[0])
+	if err != nil {
+		fatal("invalid width: %v", err)
+	}
+	h, err := strconv.Atoi(args[1])
+	if err != nil {
+		fatal("invalid height: %v", err)
+	}
+
+	scale := 1.0
+	mobile := false
+
+	for i := 2; i < len(args); i++ {
+		switch args[i] {
+		case "--scale":
+			i++
+			if i >= len(args) {
+				fatal("missing value for --scale")
+			}
+			v, err := strconv.ParseFloat(args[i], 64)
+			if err != nil {
+				fatal("invalid scale: %v", err)
+			}
+			scale = v
+		case "--mobile":
+			mobile = true
+		default:
+			fatal("unknown flag: %s", args[i])
+		}
+	}
+
+	s, _, page := withPage()
+
+	err = proto.EmulationSetDeviceMetricsOverride{
+		Width:             w,
+		Height:            h,
+		DeviceScaleFactor: scale,
+		Mobile:            mobile,
+	}.Call(page)
+	if err != nil {
+		fatal("failed to set viewport: %v", err)
+	}
+
+	// Persist viewport settings so they are re-applied on each subsequent command
+	s.ViewportWidth = w
+	s.ViewportHeight = h
+	s.ViewportScale = scale
+	s.ViewportMobile = mobile
+	if err := saveState(s); err != nil {
+		fatal("failed to save state: %v", err)
+	}
+
+	fmt.Println(formatViewportDesc("Viewport set to", w, h, mobile, scale))
+}
+
 func cmdScreenshot(args []string) {
 	fs := flag.NewFlagSet("screenshot", flag.ContinueOnError)
 	fs.SetOutput(io.Discard)
-	width := fs.Int("width", 1280, "")
-	fs.IntVar(width, "w", 1280, "")
+	width := fs.Int("width", 0, "")
+	fs.IntVar(width, "w", 0, "")
 	height := fs.Int("height", 0, "")
 	fs.IntVar(height, "h", 0, "")
 
@@ -1136,7 +1918,9 @@ func cmdScreenshot(args []string) {
 	}
 
 	fullPage := true
+	sizeExplicit := false
 	fs.Visit(func(f *flag.Flag) {
+		sizeExplicit = true
 		if f.Name == "height" || f.Name == "h" {
 			fullPage = false
 		}
@@ -1149,20 +1933,27 @@ func cmdScreenshot(args []string) {
 		file = nextAvailableFile("screenshot", ".png")
 	}
 
-	_, _, page := withPage()
+	s, _, page := withPage()
 
-	// Set viewport size
-	viewportHeight := *height
-	if viewportHeight == 0 {
-		viewportHeight = 720
-	}
-	err := proto.EmulationSetDeviceMetricsOverride{
-		Width:             *width,
-		Height:            viewportHeight,
-		DeviceScaleFactor: 1,
-	}.Call(page)
-	if err != nil {
-		fatal("failed to set viewport: %v", err)
+	// Only override viewport if -w/-h were explicitly passed, or if no
+	// viewport has been set via "rodney viewport"
+	if sizeExplicit || s.ViewportWidth == 0 {
+		w := *width
+		if w == 0 {
+			w = 1280
+		}
+		viewportHeight := *height
+		if viewportHeight == 0 {
+			viewportHeight = 720
+		}
+		err := proto.EmulationSetDeviceMetricsOverride{
+			Width:             w,
+			Height:            viewportHeight,
+			DeviceScaleFactor: 1,
+		}.Call(page)
+		if err != nil {
+			fatal("failed to set viewport: %v", err)
+		}
 	}
 
 	data, err := page.Screenshot(fullPage, nil)
@@ -1186,6 +1977,7 @@ func cmdScreenshotEl(args []string) {
 	_, _, page := withPage()
 	el, err := page.Element(args[0])
 	if err != nil {
+		hint("try 'rodney discover --interactive' to see available elements")
 		fatal("element not found: %v", err)
 	}
 	data, err := el.Screenshot(proto.PageCaptureScreenshotFormatPng, 0)
@@ -1278,7 +2070,16 @@ func cmdNewPage(args []string) {
 
 	var page *rod.Page
 	if url != "" {
-		page = browser.MustPage(url)
+		if s.Logs {
+			// Same blank-page-first strategy as cmdOpen.
+			page = browser.MustPage("")
+			waitForLogger(page)
+			if err := page.Navigate(url); err != nil {
+				fatal("navigation failed: %v", err)
+			}
+		} else {
+			page = browser.MustPage(url)
+		}
 		page.MustWaitLoad()
 	} else {
 		page = browser.MustPage("")
@@ -1343,19 +2144,42 @@ func cmdClosePage(args []string) {
 
 func cmdExists(args []string) {
 	if len(args) < 1 {
-		fatal("usage: rodney exists <selector>")
+		fatal("usage: rodney exists <selector> | --role <role> [--name <name>]")
 	}
 	_, _, page := withPage()
-	has, _, err := page.Has(args[0])
-	if err != nil {
-		fatal("query failed: %v", err)
+
+	role, name, remaining := parseAXFlags(args)
+	hasAX := role != "" || name != ""
+	hasCSS := len(remaining) > 0
+
+	if hasAX && hasCSS {
+		fatal("cannot use both a CSS selector and --role/--name flags")
 	}
-	if has {
-		fmt.Println("true")
-		os.Exit(0)
+
+	if hasAX {
+		nodes, err := queryAXNodes(page, name, role)
+		if err != nil {
+			fatal("query failed: %v", err)
+		}
+		if len(nodes) > 0 {
+			fmt.Println("true")
+			os.Exit(0)
+		} else {
+			fmt.Println("false")
+			os.Exit(1)
+		}
 	} else {
-		fmt.Println("false")
-		os.Exit(1)
+		has, _, err := page.Has(remaining[0])
+		if err != nil {
+			fatal("query failed: %v", err)
+		}
+		if has {
+			fmt.Println("true")
+			os.Exit(0)
+		} else {
+			fmt.Println("false")
+			os.Exit(1)
+		}
 	}
 }
 
@@ -1373,14 +2197,49 @@ func cmdCount(args []string) {
 
 func cmdVisible(args []string) {
 	if len(args) < 1 {
-		fatal("usage: rodney visible <selector>")
+		fatal("usage: rodney visible <selector> | --role <role> [--name <name>]")
 	}
 	_, _, page := withPage()
-	el, err := page.Element(args[0])
-	if err != nil {
-		fmt.Println("false")
-		os.Exit(1)
+
+	role, name, remaining := parseAXFlags(args)
+	hasAX := role != "" || name != ""
+	hasCSS := len(remaining) > 0
+
+	if hasAX && hasCSS {
+		fatal("cannot use both a CSS selector and --role/--name flags")
 	}
+
+	var el *rod.Element
+	if hasAX {
+		nodes, err := queryAXNodes(page, name, role)
+		if err != nil || len(nodes) == 0 {
+			fmt.Println("false")
+			os.Exit(1)
+		}
+		node := nodes[0]
+		if node.BackendDOMNodeID == 0 {
+			fmt.Println("false")
+			os.Exit(1)
+		}
+		result, err := proto.DOMResolveNode{BackendNodeID: node.BackendDOMNodeID}.Call(page)
+		if err != nil {
+			fmt.Println("false")
+			os.Exit(1)
+		}
+		el, err = page.ElementFromObject(result.Object)
+		if err != nil {
+			fmt.Println("false")
+			os.Exit(1)
+		}
+	} else {
+		var err error
+		el, err = page.Element(remaining[0])
+		if err != nil {
+			fmt.Println("false")
+			os.Exit(1)
+		}
+	}
+
 	visible, err := el.Visible()
 	if err != nil {
 		fmt.Println("false")
@@ -1437,10 +2296,56 @@ func formatAssertFail(actual string, expected *string, message string) string {
 	return fmt.Sprintf("fail: got %s", actual)
 }
 
-func cmdAssert(args []string) {
-	if len(args) < 1 {
-		fatal("usage: rodney assert <js-expression> [expected] [--message msg]")
+// resolveAssertArgs resolves stdin for `rodney assert`, returning a normalized args
+// slice where the first positional is always the JS expression string (never "-").
+// It mirrors the stdin-detection logic from cmdJS: "-" reads stdin explicitly;
+// no positional args auto-reads stdin when piped; otherwise falls through unchanged.
+func resolveAssertArgs(args []string) []string {
+	// Find index of first positional arg (skipping -m/--message pairs).
+	firstPosIdx := -1
+	for i := 0; i < len(args); i++ {
+		if args[i] == "--message" || args[i] == "-m" {
+			i++ // skip flag value
+			continue
+		}
+		firstPosIdx = i
+		break
 	}
+
+	if firstPosIdx >= 0 && args[firstPosIdx] == "-" {
+		// Explicit stdin: replace "-" with expression read from stdin.
+		data, err := io.ReadAll(os.Stdin)
+		if err != nil {
+			fatal("failed to read stdin: %v", err)
+		}
+		expr := strings.TrimSpace(string(data))
+		if expr == "" {
+			fatal("empty expression from stdin")
+		}
+		newArgs := make([]string, len(args))
+		copy(newArgs, args)
+		newArgs[firstPosIdx] = expr
+		return newArgs
+	} else if firstPosIdx == -1 {
+		// No positional args — auto-read from stdin only if it's piped.
+		if stat, err := os.Stdin.Stat(); err != nil || (stat.Mode()&os.ModeCharDevice) != 0 {
+			fatal("usage: rodney assert <js-expression> [expected] [--message msg]")
+		}
+		data, err := io.ReadAll(os.Stdin)
+		if err != nil {
+			fatal("failed to read stdin: %v", err)
+		}
+		expr := strings.TrimSpace(string(data))
+		if expr == "" {
+			fatal("empty expression from stdin")
+		}
+		return append([]string{expr}, args...)
+	}
+	return args
+}
+
+func cmdAssert(args []string) {
+	args = resolveAssertArgs(args)
 
 	expr, expected, message := parseAssertArgs(args)
 	if expr == "" {
@@ -1494,9 +2399,524 @@ func cmdAssert(args []string) {
 	}
 }
 
+// --- Composable check command ---
+
+type checkItem struct {
+	kind string // "exists", "visible", "text", "count", "assert"
+	arg1 string // selector or JS expression
+	arg2 string // expected value (for text, count, assert equality)
+}
+
+type checkResult struct {
+	Check    string `json:"check"`
+	Selector string `json:"selector,omitempty"`
+	Expr     string `json:"expr,omitempty"`
+	Pass     bool   `json:"pass"`
+	Got      string `json:"got,omitempty"`
+	Expected string `json:"expected,omitempty"`
+}
+
+// parseCheckArgs walks the argument list and builds a slice of checkItems.
+// Returns the checks, whether --json was specified, and any parse error.
+func parseCheckArgs(args []string) ([]checkItem, bool, error) {
+	var checks []checkItem
+	jsonOutput := false
+	i := 0
+	for i < len(args) {
+		switch args[i] {
+		case "--json":
+			jsonOutput = true
+			i++
+		case "--exists":
+			i++
+			if i >= len(args) {
+				return nil, false, fmt.Errorf("--exists requires a selector argument")
+			}
+			checks = append(checks, checkItem{kind: "exists", arg1: args[i]})
+			i++
+		case "--visible":
+			i++
+			if i >= len(args) {
+				return nil, false, fmt.Errorf("--visible requires a selector argument")
+			}
+			checks = append(checks, checkItem{kind: "visible", arg1: args[i]})
+			i++
+		case "--text":
+			i++
+			if i+1 >= len(args) {
+				return nil, false, fmt.Errorf("--text requires <selector> <expected> arguments")
+			}
+			checks = append(checks, checkItem{kind: "text", arg1: args[i], arg2: args[i+1]})
+			i += 2
+		case "--count":
+			i++
+			if i+1 >= len(args) {
+				return nil, false, fmt.Errorf("--count requires <selector> <expected> arguments")
+			}
+			checks = append(checks, checkItem{kind: "count", arg1: args[i], arg2: args[i+1]})
+			i += 2
+		case "--assert":
+			i++
+			if i >= len(args) {
+				return nil, false, fmt.Errorf("--assert requires an expression argument")
+			}
+			expr := args[i]
+			i++
+			// Optionally consume next arg as expected value if it doesn't start with "--"
+			expected := ""
+			if i < len(args) && !strings.HasPrefix(args[i], "--") {
+				expected = args[i]
+				i++
+			}
+			checks = append(checks, checkItem{kind: "assert", arg1: expr, arg2: expected})
+		default:
+			return nil, false, fmt.Errorf("unknown flag: %s", args[i])
+		}
+	}
+	return checks, jsonOutput, nil
+}
+
+// runCheck executes a single check against the given page and returns the result.
+func runCheck(page *rod.Page, c checkItem) checkResult {
+	switch c.kind {
+	case "exists":
+		has, _, err := page.Has(c.arg1)
+		if err != nil {
+			return checkResult{Check: "exists", Selector: c.arg1, Pass: false, Got: fmt.Sprintf("error: %v", err)}
+		}
+		return checkResult{Check: "exists", Selector: c.arg1, Pass: has, Got: fmt.Sprintf("%v", has)}
+
+	case "visible":
+		el, err := page.Element(c.arg1)
+		if err != nil {
+			return checkResult{Check: "visible", Selector: c.arg1, Pass: false, Got: "not found"}
+		}
+		vis, err := el.Visible()
+		if err != nil {
+			return checkResult{Check: "visible", Selector: c.arg1, Pass: false, Got: fmt.Sprintf("error: %v", err)}
+		}
+		return checkResult{Check: "visible", Selector: c.arg1, Pass: vis, Got: fmt.Sprintf("%v", vis)}
+
+	case "text":
+		el, err := page.Element(c.arg1)
+		if err != nil {
+			return checkResult{Check: "text", Selector: c.arg1, Pass: false, Expected: c.arg2, Got: "element not found"}
+		}
+		text, err := el.Text()
+		if err != nil {
+			return checkResult{Check: "text", Selector: c.arg1, Pass: false, Expected: c.arg2, Got: fmt.Sprintf("error: %v", err)}
+		}
+		pass := text == c.arg2
+		return checkResult{Check: "text", Selector: c.arg1, Pass: pass, Got: text, Expected: c.arg2}
+
+	case "count":
+		els, err := page.Elements(c.arg1)
+		if err != nil {
+			return checkResult{Check: "count", Selector: c.arg1, Pass: false, Expected: c.arg2, Got: fmt.Sprintf("error: %v", err)}
+		}
+		got := strconv.Itoa(len(els))
+		pass := got == c.arg2
+		return checkResult{Check: "count", Selector: c.arg1, Pass: pass, Got: got, Expected: c.arg2}
+
+	case "assert":
+		js := fmt.Sprintf(`() => { return (%s); }`, c.arg1)
+		result, err := page.Eval(js)
+		if err != nil {
+			return checkResult{Check: "assert", Expr: c.arg1, Pass: false, Got: fmt.Sprintf("error: %v", err), Expected: c.arg2}
+		}
+		v := result.Value
+		raw := v.JSON("", "")
+		var actual string
+		switch {
+		case raw == "null" || raw == "undefined":
+			actual = raw
+		case raw == "true" || raw == "false":
+			actual = raw
+		case len(raw) > 0 && raw[0] == '"':
+			actual = v.Str()
+		case len(raw) > 0 && (raw[0] == '{' || raw[0] == '['):
+			actual = v.JSON("", "  ")
+		default:
+			actual = raw
+		}
+
+		if c.arg2 != "" {
+			// Equality mode
+			pass := actual == c.arg2
+			return checkResult{Check: "assert", Expr: c.arg1, Pass: pass, Got: actual, Expected: c.arg2}
+		}
+		// Truthy mode
+		truthy := true
+		switch raw {
+		case "false", "0", "null", "undefined", `""`:
+			truthy = false
+		}
+		return checkResult{Check: "assert", Expr: c.arg1, Pass: truthy, Got: actual}
+
+	default:
+		return checkResult{Check: c.kind, Pass: false, Got: "unknown check type"}
+	}
+}
+
+// formatCheckLine formats a single check result as a human-readable line.
+func formatCheckLine(r checkResult) string {
+	status := "PASS"
+	if !r.Pass {
+		status = "FAIL"
+	}
+
+	label := r.Check
+	target := r.Selector
+	if target == "" {
+		target = r.Expr
+	}
+
+	line := fmt.Sprintf("%s  %s %s", status, label, target)
+
+	if !r.Pass {
+		if r.Expected != "" {
+			line += fmt.Sprintf(" -- got %q, expected %q", r.Got, r.Expected)
+		} else if r.Check != "exists" && r.Check != "visible" {
+			line += fmt.Sprintf(" -- got %q", r.Got)
+		}
+	} else if r.Expected != "" {
+		line += fmt.Sprintf(" = %s", r.Expected)
+	}
+
+	return line
+}
+
+func cmdCheck(args []string) {
+	checks, jsonOutput, err := parseCheckArgs(args)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "error: %s\n", err)
+		os.Exit(2)
+	}
+	if len(checks) == 0 {
+		fmt.Fprintln(os.Stderr, "error: no checks specified")
+		os.Exit(2)
+	}
+
+	_, _, page := withPage()
+
+	var results []checkResult
+	for _, c := range checks {
+		results = append(results, runCheck(page, c))
+	}
+
+	passed := 0
+	for _, r := range results {
+		if r.Pass {
+			passed++
+		}
+	}
+
+	if jsonOutput {
+		data, _ := json.MarshalIndent(results, "", "  ")
+		fmt.Println(string(data))
+	} else {
+		for _, r := range results {
+			fmt.Println(formatCheckLine(r))
+		}
+		fmt.Println("----")
+		fmt.Printf("%d/%d passed\n", passed, len(results))
+	}
+
+	if passed < len(results) {
+		os.Exit(1)
+	}
+	os.Exit(0)
+}
+
 // Ignore SIGPIPE for piped output
 func init() {
 	signal.Ignore(syscall.SIGPIPE)
+}
+
+// --- Console log commands ---
+
+type consoleEntry struct {
+	level     string
+	source    string
+	text      string
+	timestamp float64 // Unix milliseconds
+	url       string
+	line      *int
+}
+
+// formatLogLevel formats a proto.LogLogEntryLevel value as a string.
+// Kept for compatibility and unit-testing.
+func formatLogLevel(level proto.LogLogEntryLevel) string {
+	switch level {
+	case proto.LogLogEntryLevelVerbose:
+		return "verbose"
+	case proto.LogLogEntryLevelInfo:
+		return "info"
+	case proto.LogLogEntryLevelWarning:
+		return "warning"
+	case proto.LogLogEntryLevelError:
+		return "error"
+	default:
+		return string(level)
+	}
+}
+
+// consoleTypeToLevel maps a Runtime.consoleAPICalled type to a log level string.
+func consoleTypeToLevel(t proto.RuntimeConsoleAPICalledType) string {
+	switch t {
+	case proto.RuntimeConsoleAPICalledTypeDebug:
+		return "verbose"
+	case proto.RuntimeConsoleAPICalledTypeLog, proto.RuntimeConsoleAPICalledTypeInfo,
+		proto.RuntimeConsoleAPICalledTypeDir, proto.RuntimeConsoleAPICalledTypeDirxml,
+		proto.RuntimeConsoleAPICalledTypeTable, proto.RuntimeConsoleAPICalledTypeTrace,
+		proto.RuntimeConsoleAPICalledTypeStartGroup, proto.RuntimeConsoleAPICalledTypeStartGroupCollapsed,
+		proto.RuntimeConsoleAPICalledTypeEndGroup, proto.RuntimeConsoleAPICalledTypeClear,
+		proto.RuntimeConsoleAPICalledTypeCount, proto.RuntimeConsoleAPICalledTypeTimeEnd,
+		proto.RuntimeConsoleAPICalledTypeProfile, proto.RuntimeConsoleAPICalledTypeProfileEnd:
+		return "info"
+	case proto.RuntimeConsoleAPICalledTypeWarning:
+		return "warning"
+	case proto.RuntimeConsoleAPICalledTypeError, proto.RuntimeConsoleAPICalledTypeAssert:
+		return "error"
+	default:
+		return string(t)
+	}
+}
+
+// formatConsoleArgs converts Runtime RemoteObjects to a human-readable string.
+func formatConsoleArgs(args []*proto.RuntimeRemoteObject) string {
+	var parts []string
+	for _, arg := range args {
+		switch string(arg.Type) {
+		case "string":
+			parts = append(parts, arg.Value.Str())
+		case "number", "boolean":
+			parts = append(parts, arg.Value.JSON("", ""))
+		case "undefined":
+			parts = append(parts, "undefined")
+		case "null":
+			parts = append(parts, "null")
+		default:
+			if arg.Description != "" {
+				parts = append(parts, arg.Description)
+			} else {
+				parts = append(parts, arg.Value.JSON("", ""))
+			}
+		}
+	}
+	return strings.Join(parts, " ")
+}
+
+func cmdLogs(args []string) {
+	followMode := false
+	jsonOutput := false
+	limitN := -1
+
+	for i := 0; i < len(args); i++ {
+		switch args[i] {
+		case "-f", "--follow":
+			followMode = true
+		case "--json":
+			jsonOutput = true
+		case "-n":
+			i++
+			if i >= len(args) {
+				fatal("missing value for -n")
+			}
+			n, err := strconv.Atoi(args[i])
+			if err != nil || n < 1 {
+				fatal("invalid value for -n: %s", args[i])
+			}
+			limitN = n
+		default:
+			fatal("unknown flag: %s\nusage: rodney logs [-f] [-n N] [--json]", args[i])
+		}
+	}
+
+	s, err := loadState()
+	if err != nil {
+		fatal("%v", err)
+	}
+	if !s.Logs {
+		fmt.Fprintln(os.Stderr, "logs not enabled (run: rodney start --logs)")
+		os.Exit(1)
+	}
+	browser, err := connectBrowser(s)
+	if err != nil {
+		fatal("%v", err)
+	}
+	page, err := getActivePage(browser, s)
+	if err != nil {
+		fatal("%v", err)
+	}
+
+	logFile := filepath.Join(stateDir(), "logs", string(page.TargetID)+".ndjson")
+
+	if _, err := os.Stat(logFile); os.IsNotExist(err) {
+		fmt.Fprintln(os.Stderr, "no console log recorded for this page yet")
+		os.Exit(0)
+	}
+
+	if followMode {
+		fmt.Fprintln(os.Stderr, "Streaming console logs (Ctrl+C to stop)...")
+		tailLogFile(logFile, limitN, jsonOutput)
+		return
+	}
+
+	// Snapshot mode: stream the file to avoid loading it all into memory.
+	if limitN > 0 {
+		// Ring buffer: O(limitN) memory regardless of file size.
+		ring := make([]string, limitN)
+		count := 0
+		scanLogFile(logFile, func(line string) {
+			ring[count%limitN] = line
+			count++
+		})
+		start, n := 0, count
+		if count > limitN {
+			start = count % limitN
+			n = limitN
+		}
+		for i := 0; i < n; i++ {
+			printNDJSONLine(ring[(start+i)%limitN], jsonOutput)
+		}
+	} else {
+		scanLogFile(logFile, func(line string) {
+			printNDJSONLine(line, jsonOutput)
+		})
+	}
+}
+
+// scanLogFile opens logFile and calls fn for each non-empty line using a
+// streaming bufio.Scanner — no whole-file read into memory.
+func scanLogFile(logFile string, fn func(string)) {
+	f, err := os.Open(logFile)
+	if err != nil {
+		return
+	}
+	defer f.Close()
+	scanner := bufio.NewScanner(f)
+	for scanner.Scan() {
+		if line := scanner.Text(); line != "" {
+			fn(line)
+		}
+	}
+}
+
+// printNDJSONLine prints a single NDJSON log line.
+// In JSON mode it prints verbatim; otherwise it formats as "[level] text".
+func printNDJSONLine(line string, jsonOutput bool) {
+	if jsonOutput {
+		fmt.Println(line)
+		return
+	}
+	var obj struct {
+		Level string `json:"level"`
+		Text  string `json:"text"`
+	}
+	if err := json.Unmarshal([]byte(line), &obj); err == nil {
+		fmt.Printf("[%s] %s\n", obj.Level, obj.Text)
+	}
+}
+
+// tailLogFile follows a log file, printing new lines as they are appended.
+// If limitN > 0, prints the last N existing lines first, then follows new content.
+// If limitN <= 0, seeks to the end immediately and only shows new entries.
+func tailLogFile(logFile string, limitN int, jsonOutput bool) {
+	f, err := os.Open(logFile)
+	if err != nil {
+		fatal("failed to open log file: %v", err)
+	}
+	defer f.Close()
+
+	if limitN > 0 {
+		// Ring buffer: stream last N lines without loading the whole file.
+		ring := make([]string, limitN)
+		count := 0
+		scanner := bufio.NewScanner(f)
+		for scanner.Scan() {
+			if line := scanner.Text(); line != "" {
+				ring[count%limitN] = line
+				count++
+			}
+		}
+		start, n := 0, count
+		if count > limitN {
+			start = count % limitN
+			n = limitN
+		}
+		for i := 0; i < n; i++ {
+			printNDJSONLine(ring[(start+i)%limitN], jsonOutput)
+		}
+	}
+	// Seek to end to tail only new content (scanner may have over-read into
+	// a bufio buffer, but explicit SeekEnd corrects the OS file position).
+	f.Seek(0, io.SeekEnd)
+
+	sigCh := make(chan os.Signal, 1)
+	signal.Notify(sigCh, syscall.SIGINT, syscall.SIGTERM)
+
+	buf := make([]byte, 4096)
+	var partial string
+	for {
+		select {
+		case <-sigCh:
+			return
+		default:
+		}
+		n, _ := f.Read(buf)
+		if n > 0 {
+			partial += string(buf[:n])
+			for {
+				idx := strings.Index(partial, "\n")
+				if idx < 0 {
+					break
+				}
+				line := partial[:idx]
+				partial = partial[idx+1:]
+				if line != "" {
+					printNDJSONLine(line, jsonOutput)
+				}
+			}
+		} else {
+			time.Sleep(50 * time.Millisecond)
+		}
+	}
+}
+
+func makeConsoleEntry(e *proto.RuntimeConsoleAPICalled) consoleEntry {
+	entry := consoleEntry{
+		level:     consoleTypeToLevel(e.Type),
+		source:    "javascript",
+		text:      formatConsoleArgs(e.Args),
+		timestamp: float64(e.Timestamp),
+	}
+	if e.StackTrace != nil && len(e.StackTrace.CallFrames) > 0 {
+		frame := e.StackTrace.CallFrames[0]
+		entry.url = frame.URL
+		line := frame.LineNumber
+		entry.line = &line
+	}
+	return entry
+}
+
+// marshalConsoleEntry serializes a consoleEntry to a JSON line for the NDJSON log file.
+func marshalConsoleEntry(entry consoleEntry) string {
+	ts := time.UnixMilli(int64(entry.timestamp)).UTC()
+	obj := map[string]interface{}{
+		"level":     entry.level,
+		"source":    entry.source,
+		"text":      entry.text,
+		"timestamp": ts.Format("2006-01-02T15:04:05.000Z07:00"),
+	}
+	if entry.url != "" {
+		obj["url"] = entry.url
+	}
+	if entry.line != nil {
+		obj["line"] = *entry.line
+	}
+	data, _ := json.Marshal(obj)
+	return string(data)
 }
 
 // --- Accessibility commands ---
@@ -1555,6 +2975,7 @@ func cmdAXFind(args []string) {
 	}
 
 	if len(nodes) == 0 {
+		hint("try broader criteria — 'rodney ax-tree' shows all available nodes")
 		fmt.Fprintln(os.Stderr, "No matching nodes")
 		os.Exit(1)
 	}
@@ -1598,6 +3019,561 @@ func cmdAXNode(args []string) {
 		fmt.Println(formatAXNodeDetailJSON(node))
 	} else {
 		fmt.Print(formatAXNodeDetail(node))
+	}
+}
+
+type discoverEntry struct {
+	ID      string `json:"id"`
+	Tag     string `json:"tag"`
+	Action  string `json:"action"`
+	Text    string `json:"text"`
+	Visible bool   `json:"visible"`
+}
+
+// queryDiscoverEntries finds all elements with the given attribute and returns structured entries.
+func queryDiscoverEntries(page *rod.Page, attrName string) ([]discoverEntry, error) {
+	js := fmt.Sprintf(`() => {
+		var results = [];
+		var els = document.querySelectorAll('[%s]');
+		for (var i = 0; i < els.length; i++) {
+			var el = els[i];
+			var id = el.getAttribute('%s');
+			var tag = el.tagName.toLowerCase();
+			var type = el.getAttribute('type') || '';
+			var text = '';
+			var visible = el.offsetParent !== null || el.style.display !== 'none';
+			var action = 'text';
+
+			if (tag === 'input' || tag === 'textarea') {
+				action = 'input';
+				text = el.placeholder || el.value || '';
+			} else if (tag === 'select') {
+				action = 'select';
+				var opts = [];
+				for (var j = 0; j < el.options.length; j++) opts.push(el.options[j].text);
+				text = opts.join(', ');
+			} else if (tag === 'button' || type === 'submit') {
+				action = 'click';
+				text = el.textContent.trim().substring(0, 60);
+			} else if (tag === 'a') {
+				action = 'click';
+				text = el.textContent.trim().substring(0, 40);
+				var href = el.getAttribute('href');
+				if (href) text = text + ' -> ' + href;
+			} else if (tag === 'table') {
+				action = 'text';
+				var headers = [];
+				el.querySelectorAll('th').forEach(function(th) { headers.push(th.textContent.trim()); });
+				var rows = el.querySelectorAll('tbody tr').length;
+				text = headers.join(', ') + ' (' + rows + ' rows)';
+			} else {
+				text = el.textContent.trim().substring(0, 60);
+			}
+
+			results.push({
+				id: id,
+				tag: tag,
+				action: action,
+				text: text,
+				visible: visible
+			});
+		}
+		return results;
+	}`, attrName, attrName)
+
+	result, err := page.Eval(js)
+	if err != nil {
+		return nil, fmt.Errorf("discover eval failed: %w", err)
+	}
+
+	raw := result.Value.JSON("", "")
+	var entries []discoverEntry
+	if jsonErr := json.Unmarshal([]byte(raw), &entries); jsonErr != nil {
+		return nil, fmt.Errorf("failed to parse discover results: %w", jsonErr)
+	}
+	return entries, nil
+}
+
+// formatDiscoverText formats discover entries as human-readable grouped output.
+func formatDiscoverText(entries []discoverEntry, attrName, pageURL string) string {
+	var buf strings.Builder
+	fmt.Fprintf(&buf, "Page: %s\n\n", pageURL)
+
+	type group struct {
+		label   string
+		entries []discoverEntry
+	}
+	groups := []group{
+		{"Readable", nil},
+		{"Interactive", nil},
+		{"Hidden", nil},
+	}
+	for _, e := range entries {
+		if !e.Visible {
+			groups[2].entries = append(groups[2].entries, e)
+		} else if e.Action == "text" {
+			groups[0].entries = append(groups[0].entries, e)
+		} else {
+			groups[1].entries = append(groups[1].entries, e)
+		}
+	}
+
+	sel := func(id string) string {
+		return fmt.Sprintf(`[%s="%s"]`, attrName, id)
+	}
+
+	for _, g := range groups {
+		if len(g.entries) == 0 {
+			continue
+		}
+		fmt.Fprintf(&buf, "%s:\n", g.label)
+		for _, e := range g.entries {
+			display := e.Text
+			if len(display) > 40 {
+				display = display[:37] + "..."
+			}
+			cmd := ""
+			switch e.Action {
+			case "text":
+				cmd = fmt.Sprintf("rodney text '%s'", sel(e.ID))
+			case "input":
+				cmd = fmt.Sprintf("rodney input '%s' \"<text>\"", sel(e.ID))
+			case "click":
+				cmd = fmt.Sprintf("rodney click '%s'", sel(e.ID))
+			case "select":
+				cmd = fmt.Sprintf("rodney select '%s' \"<value>\"", sel(e.ID))
+			}
+			fmt.Fprintf(&buf, "  %-22s %-42s %s\n", e.ID, display, cmd)
+		}
+		fmt.Fprintln(&buf)
+	}
+	return buf.String()
+}
+
+// discoverFormEntry represents a single form field found by --forms mode.
+type discoverFormEntry struct {
+	FormSelector string `json:"form_selector"`
+	FormAction   string `json:"form_action,omitempty"`
+	Selector     string `json:"selector"`
+	Tag          string `json:"tag"`
+	Type         string `json:"type,omitempty"`
+	Name         string `json:"name,omitempty"`
+	Label        string `json:"label,omitempty"`
+	Command      string `json:"command"`
+}
+
+// queryDiscoverForms finds all forms and their fields, returning structured entries.
+func queryDiscoverForms(page *rod.Page) ([]discoverFormEntry, error) {
+	js := `() => {
+		var results = [];
+		var forms = document.querySelectorAll('form');
+		forms.forEach(function(form, fi) {
+			var formSel = '';
+			if (form.id) formSel = 'form#' + form.id;
+			else if (form.name) formSel = 'form[name="' + form.name + '"]';
+			else if (fi === 0 && forms.length === 1) formSel = 'form';
+			else formSel = 'form:nth-of-type(' + (fi+1) + ')';
+			var formAction = form.getAttribute('action') || '';
+
+			var fields = form.querySelectorAll('input, select, textarea, button');
+			fields.forEach(function(el) {
+				var tag = el.tagName.toLowerCase();
+				var type = el.getAttribute('type') || '';
+				var name = el.getAttribute('name') || '';
+				var id = el.id || '';
+				var label = '';
+
+				// Try to find associated label
+				if (id) {
+					var lbl = document.querySelector('label[for="' + id + '"]');
+					if (lbl) label = lbl.textContent.trim();
+				}
+				if (!label && el.getAttribute('aria-label')) {
+					label = el.getAttribute('aria-label');
+				}
+				if (!label && el.placeholder) {
+					label = el.placeholder;
+				}
+				if (!label && tag === 'button') {
+					label = el.textContent.trim();
+				}
+
+				// Build best selector
+				var sel = '';
+				if (id) sel = '#' + id;
+				else if (name) sel = tag + '[name="' + name + '"]';
+				else if (type === 'submit' || tag === 'button') sel = tag + '[type="submit"]';
+				else sel = tag;
+
+				// Determine command
+				var cmd = '';
+				if (tag === 'select') {
+					cmd = 'rodney select "' + sel + '" "TODO"';
+				} else if (tag === 'textarea' || (tag === 'input' && type !== 'submit' && type !== 'button' && type !== 'file')) {
+					cmd = 'rodney input "' + sel + '" "TODO"';
+				} else if (type === 'file') {
+					cmd = 'rodney file "' + sel + '" "TODO"';
+				} else if (tag === 'button' || type === 'submit' || type === 'button') {
+					cmd = 'rodney click "' + sel + '"';
+				}
+
+				results.push({
+					form_selector: formSel,
+					form_action: formAction,
+					selector: sel,
+					tag: tag,
+					type: type,
+					name: name,
+					label: label,
+					command: cmd
+				});
+			});
+		});
+		return results;
+	}`
+
+	result, err := page.Eval(js)
+	if err != nil {
+		return nil, fmt.Errorf("discover forms eval failed: %w", err)
+	}
+
+	raw := result.Value.JSON("", "")
+	var entries []discoverFormEntry
+	if jsonErr := json.Unmarshal([]byte(raw), &entries); jsonErr != nil {
+		return nil, fmt.Errorf("failed to parse form results: %w", jsonErr)
+	}
+	return entries, nil
+}
+
+// formatDiscoverFormsText formats form entries as human-readable output.
+func formatDiscoverFormsText(entries []discoverFormEntry) string {
+	var buf strings.Builder
+	currentForm := ""
+	for _, e := range entries {
+		if e.FormSelector != currentForm {
+			if currentForm != "" {
+				fmt.Fprintln(&buf)
+			}
+			currentForm = e.FormSelector
+			header := fmt.Sprintf("Form: %s", e.FormSelector)
+			if e.FormAction != "" {
+				header += fmt.Sprintf(" (action=%q)", e.FormAction)
+			}
+			fmt.Fprintln(&buf, header)
+		}
+		comment := ""
+		if e.Label != "" {
+			comment = "# " + e.Label
+		}
+		if e.Type != "" && comment == "" {
+			comment = "# (type=" + e.Type + ")"
+		} else if e.Type != "" {
+			comment += " (type=" + e.Type + ")"
+		}
+		if comment != "" {
+			fmt.Fprintf(&buf, "  %-50s %s\n", e.Command, comment)
+		} else {
+			fmt.Fprintf(&buf, "  %s\n", e.Command)
+		}
+	}
+	return buf.String()
+}
+
+// discoverLinkEntry represents a single link found by --links mode.
+type discoverLinkEntry struct {
+	Selector string `json:"selector"`
+	Href     string `json:"href"`
+	Text     string `json:"text"`
+	Command  string `json:"command"`
+}
+
+// queryDiscoverLinks finds all anchor elements with href attributes.
+func queryDiscoverLinks(page *rod.Page) ([]discoverLinkEntry, error) {
+	js := `() => {
+		var results = [];
+		var links = document.querySelectorAll('a[href]');
+		links.forEach(function(el) {
+			var href = el.getAttribute('href') || '';
+			var text = el.textContent.trim().substring(0, 60);
+			var id = el.id || '';
+
+			// Build best selector
+			var sel = '';
+			if (id) sel = 'a#' + id;
+			else if (href) sel = 'a[href="' + href.replace(/"/g, '\\"') + '"]';
+			else sel = 'a';
+
+			results.push({
+				selector: sel,
+				href: href,
+				text: text,
+				command: 'rodney click "' + sel + '"'
+			});
+		});
+		return results;
+	}`
+
+	result, err := page.Eval(js)
+	if err != nil {
+		return nil, fmt.Errorf("discover links eval failed: %w", err)
+	}
+
+	raw := result.Value.JSON("", "")
+	var entries []discoverLinkEntry
+	if jsonErr := json.Unmarshal([]byte(raw), &entries); jsonErr != nil {
+		return nil, fmt.Errorf("failed to parse link results: %w", jsonErr)
+	}
+	return entries, nil
+}
+
+// formatDiscoverLinksText formats link entries as human-readable output.
+func formatDiscoverLinksText(entries []discoverLinkEntry, pageURL string) string {
+	var buf strings.Builder
+	if pageURL != "" {
+		fmt.Fprintf(&buf, "Links on %s:\n", pageURL)
+	} else {
+		fmt.Fprintln(&buf, "Links:")
+	}
+	for _, e := range entries {
+		comment := ""
+		if e.Text != "" {
+			comment = "# " + e.Text
+		}
+		if comment != "" {
+			fmt.Fprintf(&buf, "  %-50s %s\n", e.Command, comment)
+		} else {
+			fmt.Fprintf(&buf, "  %s\n", e.Command)
+		}
+	}
+	return buf.String()
+}
+
+// discoverInteractiveEntry represents an interactive element found by --interactive mode.
+type discoverInteractiveEntry struct {
+	Selector string `json:"selector"`
+	Tag      string `json:"tag"`
+	Type     string `json:"type,omitempty"`
+	Role     string `json:"role,omitempty"`
+	Text     string `json:"text"`
+	Command  string `json:"command"`
+}
+
+// queryDiscoverInteractive finds all interactive/focusable elements on the page.
+func queryDiscoverInteractive(page *rod.Page) ([]discoverInteractiveEntry, error) {
+	js := `() => {
+		var results = [];
+		var seen = new Set();
+		var els = document.querySelectorAll('button, a[href], input, select, textarea, [role="button"], [tabindex]');
+		els.forEach(function(el) {
+			// Deduplicate by element reference
+			if (seen.has(el)) return;
+			seen.add(el);
+
+			var tag = el.tagName.toLowerCase();
+			var type = el.getAttribute('type') || '';
+			var role = el.getAttribute('role') || '';
+			var id = el.id || '';
+			var name = el.getAttribute('name') || '';
+			var text = '';
+
+			// Get descriptive text
+			if (el.getAttribute('aria-label')) {
+				text = el.getAttribute('aria-label');
+			} else if (tag === 'input' || tag === 'textarea') {
+				// Find associated label
+				if (id) {
+					var lbl = document.querySelector('label[for="' + id + '"]');
+					if (lbl) text = lbl.textContent.trim();
+				}
+				if (!text) text = el.placeholder || '';
+			} else {
+				text = el.textContent.trim().substring(0, 60);
+			}
+
+			// Build best selector
+			var sel = '';
+			if (id) sel = tag + '#' + id;
+			else if (name) sel = tag + '[name="' + name + '"]';
+			else if (tag === 'a') {
+				var href = el.getAttribute('href');
+				if (href) sel = 'a[href="' + href.replace(/"/g, '\\"') + '"]';
+				else sel = 'a';
+			} else if (role) {
+				sel = '[role="' + role + '"]';
+			} else {
+				sel = tag;
+			}
+
+			// Determine command
+			var cmd = '';
+			if (tag === 'select') {
+				cmd = 'rodney select "' + sel + '" "TODO"';
+			} else if (tag === 'input' && type === 'file') {
+				cmd = 'rodney file "' + sel + '" "TODO"';
+			} else if (tag === 'input' || tag === 'textarea') {
+				cmd = 'rodney input "' + sel + '" "TODO"';
+			} else {
+				cmd = 'rodney click "' + sel + '"';
+			}
+
+			// Determine effective role for display
+			var effectiveRole = role;
+			if (!effectiveRole) {
+				if (tag === 'button') effectiveRole = 'button';
+				else if (tag === 'a') effectiveRole = 'link';
+				else if (tag === 'input' && (type === 'text' || type === '' || type === 'email' || type === 'password' || type === 'search' || type === 'tel' || type === 'url' || type === 'number')) effectiveRole = 'textbox';
+				else if (tag === 'input' && type === 'checkbox') effectiveRole = 'checkbox';
+				else if (tag === 'input' && type === 'radio') effectiveRole = 'radio';
+				else if (tag === 'input' && type === 'file') effectiveRole = 'file';
+				else if (tag === 'textarea') effectiveRole = 'textbox';
+				else if (tag === 'select') effectiveRole = 'combobox';
+			}
+
+			results.push({
+				selector: sel,
+				tag: tag,
+				type: type,
+				role: effectiveRole,
+				text: text,
+				command: cmd
+			});
+		});
+		return results;
+	}`
+
+	result, err := page.Eval(js)
+	if err != nil {
+		return nil, fmt.Errorf("discover interactive eval failed: %w", err)
+	}
+
+	raw := result.Value.JSON("", "")
+	var entries []discoverInteractiveEntry
+	if jsonErr := json.Unmarshal([]byte(raw), &entries); jsonErr != nil {
+		return nil, fmt.Errorf("failed to parse interactive results: %w", jsonErr)
+	}
+	return entries, nil
+}
+
+// formatDiscoverInteractiveText formats interactive entries as human-readable output.
+func formatDiscoverInteractiveText(entries []discoverInteractiveEntry) string {
+	var buf strings.Builder
+	fmt.Fprintln(&buf, "Interactive elements:")
+	for _, e := range entries {
+		comment := ""
+		if e.Text != "" {
+			comment = "# " + e.Text
+		}
+		if e.Role != "" {
+			if comment != "" {
+				comment += " (" + e.Role + ")"
+			} else {
+				comment = "# (" + e.Role + ")"
+			}
+		}
+		if comment != "" {
+			fmt.Fprintf(&buf, "  %-50s %s\n", e.Command, comment)
+		} else {
+			fmt.Fprintf(&buf, "  %s\n", e.Command)
+		}
+	}
+	return buf.String()
+}
+
+func cmdDiscover(args []string) {
+	jsonOutput := false
+	attrName := "data-testid"
+	modeForms := false
+	modeLinks := false
+	modeInteractive := false
+	for i := 0; i < len(args); i++ {
+		switch args[i] {
+		case "--json":
+			jsonOutput = true
+		case "--attr":
+			if i+1 >= len(args) {
+				fatal("--attr requires a value")
+			}
+			i++
+			attrName = args[i]
+		case "--forms":
+			modeForms = true
+		case "--links":
+			modeLinks = true
+		case "--interactive":
+			modeInteractive = true
+		}
+	}
+
+	// Check mutual exclusivity of modes
+	modeCount := 0
+	if modeForms {
+		modeCount++
+	}
+	if modeLinks {
+		modeCount++
+	}
+	if modeInteractive {
+		modeCount++
+	}
+	if modeCount > 1 {
+		fatal("--forms, --links, and --interactive are mutually exclusive")
+	}
+
+	_, _, page := withPage()
+	info, _ := page.Info()
+	pageURL := ""
+	if info != nil {
+		pageURL = info.URL
+	}
+
+	switch {
+	case modeForms:
+		entries, err := queryDiscoverForms(page)
+		if err != nil {
+			fatal("%v", err)
+		}
+		if jsonOutput {
+			out, _ := json.MarshalIndent(entries, "", "  ")
+			fmt.Println(string(out))
+			return
+		}
+		fmt.Print(formatDiscoverFormsText(entries))
+
+	case modeLinks:
+		entries, err := queryDiscoverLinks(page)
+		if err != nil {
+			fatal("%v", err)
+		}
+		if jsonOutput {
+			out, _ := json.MarshalIndent(entries, "", "  ")
+			fmt.Println(string(out))
+			return
+		}
+		fmt.Print(formatDiscoverLinksText(entries, pageURL))
+
+	case modeInteractive:
+		entries, err := queryDiscoverInteractive(page)
+		if err != nil {
+			fatal("%v", err)
+		}
+		if jsonOutput {
+			out, _ := json.MarshalIndent(entries, "", "  ")
+			fmt.Println(string(out))
+			return
+		}
+		fmt.Print(formatDiscoverInteractiveText(entries))
+
+	default:
+		entries, err := queryDiscoverEntries(page, attrName)
+		if err != nil {
+			fatal("%v", err)
+		}
+		if jsonOutput {
+			out, _ := json.MarshalIndent(entries, "", "  ")
+			fmt.Println(string(out))
+			return
+		}
+		fmt.Print(formatDiscoverText(entries, attrName, pageURL))
 	}
 }
 
@@ -1827,6 +3803,116 @@ func formatAXNodeDetailJSON(node *proto.AccessibilityAXNode) string {
 		return "{}"
 	}
 	return string(data)
+}
+
+// --- Console logger subprocess ---
+
+func cmdInternalLogger(args []string) {
+	if len(args) < 2 {
+		fatal("usage: rodney _logger <debugURL> <logsDir>")
+	}
+	debugURL := args[0]
+	logsDir := args[1]
+
+	browser := rod.New().ControlURL(debugURL).MustConnect()
+	os.MkdirAll(logsDir, 0755)
+
+	var mu sync.Mutex
+	tracking := map[proto.TargetTargetID]bool{}
+
+	// subscribeToPage marks the target as tracked and starts trackPage in a
+	// goroutine. It looks up the *rod.Page by target ID; retries briefly in
+	// case GetTargets lags slightly behind the TargetCreated event.
+	subscribeToPage := func(targetID proto.TargetTargetID) {
+		mu.Lock()
+		already := tracking[targetID]
+		if !already {
+			tracking[targetID] = true
+		}
+		mu.Unlock()
+		if already {
+			return
+		}
+		go func() {
+			for i := 0; i < 10; i++ {
+				pages, _ := browser.Pages()
+				for _, p := range pages {
+					if p.TargetID == targetID {
+						trackPage(p, logsDir)
+						return
+					}
+				}
+				time.Sleep(10 * time.Millisecond)
+			}
+		}()
+	}
+
+	// TargetSetDiscoverTargets causes Chrome to fire TargetTargetCreated for
+	// all existing targets immediately, and for every new target thereafter.
+	// Set up the listener first so we don't miss events.
+	wait := browser.EachEvent(func(e *proto.TargetTargetCreated) bool {
+		if e.TargetInfo.Type == "page" {
+			subscribeToPage(e.TargetInfo.TargetID)
+		}
+		return false
+	})
+	proto.TargetSetDiscoverTargets{Discover: true}.Call(browser)
+	go wait()
+
+	sigCh := make(chan os.Signal, 1)
+	signal.Notify(sigCh, syscall.SIGINT, syscall.SIGTERM)
+	<-sigCh
+}
+
+// trackPage subscribes to console events for a single page and writes them to
+// a per-page NDJSON file. Blocks until the page is closed or context cancelled.
+//
+// The log file is opened *after* RuntimeEnable returns (which blocks until
+// Chrome acks the command). This means the file's creation on disk is an exact
+// signal that Chrome is ready to send events — waitForLogger relies on this.
+func trackPage(page *rod.Page, logsDir string) {
+	logFile := filepath.Join(logsDir, string(page.TargetID)+".ndjson")
+
+	// Register the listener before enabling so no events are missed.
+	// f starts nil; callback skips writes until f is set below.
+	var f *os.File
+	wait := page.EachEvent(func(e *proto.RuntimeConsoleAPICalled) bool {
+		if f != nil {
+			fmt.Fprintln(f, marshalConsoleEntry(makeConsoleEntry(e)))
+			f.Sync()
+		}
+		return false
+	})
+
+	// Enable runtime; blocks until Chrome acknowledges.
+	if err := (proto.RuntimeEnable{}).Call(page); err != nil {
+		return
+	}
+
+	// Open the log file now. Its appearance on disk is the ready signal
+	// consumed by waitForLogger in cmdOpen/cmdNewPage.
+	var err error
+	f, err = os.OpenFile(logFile, os.O_CREATE|os.O_APPEND|os.O_WRONLY, 0644)
+	if err != nil {
+		return
+	}
+	defer f.Close()
+
+	wait() // blocks until page closed or context cancelled; f is non-nil
+}
+
+// waitForLogger polls until _logger has subscribed to page and called
+// RuntimeEnable (signalled by the log file appearing on disk), or until a
+// 500ms timeout expires. Called before navigating a freshly-created blank page.
+func waitForLogger(page *rod.Page) {
+	logFile := filepath.Join(stateDir(), "logs", string(page.TargetID)+".ndjson")
+	deadline := time.Now().Add(500 * time.Millisecond)
+	for time.Now().Before(deadline) {
+		if _, err := os.Stat(logFile); err == nil {
+			return
+		}
+		time.Sleep(5 * time.Millisecond)
+	}
 }
 
 // --- Auth proxy for environments with authenticated HTTP proxies ---

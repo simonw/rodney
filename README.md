@@ -1,11 +1,34 @@
 # Rodney: Chrome automation from the command line
 
-[![PyPI](https://img.shields.io/pypi/v/rodney.svg)](https://pypi.org/project/rodney/)
-[![Changelog](https://img.shields.io/github/v/release/simonw/rodney?include_prereleases&label=changelog)](https://github.com/simonw/rodney/releases)
-[![Tests](https://github.com/simonw/rodney/actions/workflows/test.yml/badge.svg)](https://github.com/simonw/rodney/actions/workflows/test.yml)
-[![License](https://img.shields.io/badge/license-Apache%202.0-blue.svg)](https://github.com/simonw/rodney/blob/main/LICENSE)
+[![Changelog](https://img.shields.io/github/v/release/Battle-Creek-LLC/rodney?include_prereleases&label=changelog)](https://github.com/Battle-Creek-LLC/rodney/releases)
+[![Tests](https://github.com/Battle-Creek-LLC/rodney/actions/workflows/test.yml/badge.svg)](https://github.com/Battle-Creek-LLC/rodney/actions/workflows/test.yml)
+[![License](https://img.shields.io/badge/license-Apache%202.0-blue.svg)](https://github.com/Battle-Creek-LLC/rodney/blob/main/LICENSE)
 
 A Go CLI tool that drives a persistent headless Chrome instance using the [rod](https://github.com/go-rod/rod) browser automation library. Each command connects to the same long-running Chrome process, making it easy to script multi-step browser interactions from shell scripts or interactive use.
+
+This is the Battle-Creek-LLC fork of [simonw/rodney](https://github.com/simonw/rodney).
+
+## Installation
+
+Install the Go binary directly:
+```bash
+go install github.com/battle-creek-llc/rodney@latest
+```
+Or run it without installation:
+```bash
+go run github.com/battle-creek-llc/rodney@latest --help
+```
+Compiled binaries are available [on the releases page](https://github.com/Battle-Creek-LLC/rodney/releases). On macOS you may need to [follow these extra steps](https://support.apple.com/en-us/102445) to use those.
+
+## Building
+
+```bash
+go build -o rodney .
+```
+
+Requires:
+- Go 1.21+
+- Google Chrome or Chromium installed (or set `ROD_CHROME_BIN=/path/to/chrome`)
 
 ## Architecture
 
@@ -26,16 +49,6 @@ rodney stop           →  connects and shuts down Chrome, cleans up state
 
 Each CLI invocation is a short-lived process. Chrome runs independently and tabs persist between commands.
 
-## Building
-
-```bash
-go build -o rodney .
-```
-
-Requires:
-- Go 1.21+
-- Google Chrome or Chromium installed (or set `ROD_CHROME_BIN=/path/to/chrome`)
-
 ## Usage
 
 ### Start/stop the browser
@@ -44,6 +57,8 @@ Requires:
 rodney start              # Launch headless Chrome
 rodney start --show       # Launch with visible browser window
 rodney start --insecure   # Launch with TLS errors ignored (-k shorthand)
+rodney start --fake-media # Launch with fake media devices (avoids getUserMedia crashes)
+rodney start --viewport 375x812 --mobile --scale 2  # Start with mobile viewport
 rodney connect host:9222  # Connect to existing Chrome on remote debug port
 rodney status             # Show browser info and active page
 rodney stop               # Shut down Chrome
@@ -73,6 +88,24 @@ rodney attr "a#link" href     # Print attribute value
 rodney pdf output.pdf         # Save page as PDF
 ```
 
+### Console logs
+
+```bash
+rodney logs                   # Print all buffered console logs and exit
+rodney logs -n 5              # Print last 5 buffered log entries
+rodney logs -f                # Print buffered logs, then stream new ones (Ctrl+C to stop)
+rodney logs -f -n 5           # Print last 5 buffered logs, then stream new ones
+rodney logs --json            # JSON output (one object per line)
+```
+
+Text output format: `[level] message` (e.g. `[error] Uncaught TypeError: ...`).
+
+JSON output format (one object per line):
+```json
+{"level":"info","source":"javascript","text":"Page initialized","timestamp":"2024-01-01T12:00:00.123Z"}
+{"level":"error","source":"javascript","text":"Uncaught TypeError: ...","timestamp":"2024-01-01T12:00:00.456Z","url":"https://example.com/app.js","line":42}
+```
+
 ### Run JavaScript
 
 ```bash
@@ -81,9 +114,14 @@ rodney js "1 + 2"                               # Math
 rodney js 'document.querySelector("h1").textContent'  # DOM queries
 rodney js '[1,2,3].map(x => x * 2)'            # Returns pretty-printed JSON
 rodney js 'document.querySelectorAll("a").length'     # Count elements
+echo 'document.title' | rodney js              # Read expression from stdin
+cat script.js | rodney js                       # Execute a JS file via stdin
+rodney js -                                     # Read from stdin explicitly
 ```
 
 The expression is automatically wrapped in `() => { return (expr); }`.
+
+When no argument is given and stdin is piped, the expression is read from stdin. Pass `-` as the argument to read from stdin explicitly.
 
 ### Interact with elements
 
@@ -116,8 +154,20 @@ rodney sleep 2.5            # Sleep for N seconds
 ```bash
 rodney screenshot                         # Save as screenshot.png
 rodney screenshot page.png                # Save to specific file
-rodney screenshot -w 1280 -h 720 out.png  # Set viewport width/height
+rodney screenshot -w 1280 -h 720 out.png  # Override viewport width/height
 rodney screenshot-el ".chart" chart.png   # Screenshot specific element
+```
+
+When a viewport has been set via `rodney viewport`, screenshots use that viewport by default. Pass `-w`/`-h` to override.
+
+### Viewport / mobile emulation
+
+```bash
+rodney viewport 375 812                      # iPhone-sized viewport
+rodney viewport 375 812 --mobile             # With mobile emulation (viewport meta, etc.)
+rodney viewport 375 812 --mobile --scale 3   # Retina-class device pixel ratio
+rodney viewport 1280 720                     # Desktop viewport
+rodney viewport --reset                      # Reset to browser default
 ```
 
 ### Manage tabs
@@ -381,7 +431,7 @@ In environments with authenticated HTTP proxies (e.g., `HTTPS_PROXY=http://user:
 
 This is necessary because Chrome cannot natively authenticate to proxies during HTTPS tunnel (CONNECT) establishment. The local proxy runs as a background process and is automatically cleaned up by `rodney stop`.
 
-See [claude-code-chrome-proxy.md](claude-code-chrome-proxy.md) for detailed technical notes.
+See [notes/claude-chrome-proxy](notes/claude-chrome-proxy) for detailed technical notes.
 
 ## How it works
 
@@ -403,7 +453,7 @@ The tool uses the [rod](https://github.com/go-rod/rod) Go library which communic
 
 | Command | Arguments | Description |
 |---|---|---|
-| `start` | `[--show] [--insecure\|-k]` | Launch Chrome (headless by default, `--show` for visible) |
+| `start` | `[--show] [--insecure\|-k] [--logs] [--fake-media] [--viewport WxH] [--mobile] [--scale N]` | Launch Chrome (headless by default, `--show` for visible) |
 | `connect` | `<host:port>` | Connect to existing Chrome on remote debug port |
 | `stop` | | Shut down Chrome |
 | `status` | | Show browser status |
@@ -418,7 +468,7 @@ The tool uses the [rod](https://github.com/go-rod/rod) Go library which communic
 | `text` | `<selector>` | Print element text content |
 | `attr` | `<selector> <name>` | Print attribute value |
 | `pdf` | `[file]` | Save page as PDF |
-| `js` | `<expression>` | Evaluate JavaScript |
+| `js` | `<expression>\|-` | Evaluate JavaScript (`-` or no arg reads from stdin) |
 | `click` | `<selector>` | Click element |
 | `input` | `<selector> <text>` | Type into input |
 | `clear` | `<selector>` | Clear input |
@@ -435,6 +485,8 @@ The tool uses the [rod](https://github.com/go-rod/rod) Go library which communic
 | `sleep` | `<seconds>` | Sleep N seconds |
 | `screenshot` | `[-w N] [-h N] [file]` | Page screenshot (optional viewport size) |
 | `screenshot-el` | `<selector> [file]` | Element screenshot |
+| `viewport` | `<width> <height> [--scale N] [--mobile]` | Set browser viewport size |
+| `viewport` | `--reset` | Reset viewport to browser default |
 | `pages` | | List tabs |
 | `page` | `<index>` | Switch tab |
 | `newpage` | `[url]` | Open new tab |
@@ -443,6 +495,7 @@ The tool uses the [rod](https://github.com/go-rod/rod) Go library which communic
 | `count` | `<selector>` | Count matching elements |
 | `visible` | `<selector>` | Check element visible (exit 1 if not) |
 | `assert` | `<expr> [expected] [-m msg]` | Assert JS expression is truthy or equals expected (exit 1 if not) |
+| `logs` | `[-f] [-n N] [--json]` | Print console logs (snapshot or stream with `-f`) |
 | `ax-tree` | `[--depth N] [--json]` | Dump accessibility tree |
 | `ax-find` | `[--name N] [--role R] [--json]` | Find accessible nodes |
 | `ax-node` | `<selector> [--json]` | Show element accessibility info |
@@ -455,3 +508,13 @@ The tool uses the [rod](https://github.com/go-rod/rod) Go library which communic
 | `--global` | Use global session (`~/.rodney/`) |
 | `--version` | Print version and exit |
 | `--help`, `-h`, `help` | Show help message |
+
+## Comparing with upstream
+
+This fork adds features on top of [simonw/rodney](https://github.com/simonw/rodney). To see how this fork diverges from upstream:
+
+```bash
+./scripts/compare-upstream.sh
+```
+
+The script fetches both remotes, shows commit divergence in each direction, and prints a file-level diff summary. If upstream has commits this fork is missing, it will suggest the merge command.

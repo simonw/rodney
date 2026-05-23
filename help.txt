@@ -1,7 +1,10 @@
 rodney - Chrome automation from the command line
 
 Browser lifecycle:
-  rodney start [--show] [--insecure | -k]  Launch Chrome (headless by default, --show for visible)
+  rodney start [--show] [--insecure | -k] [--logs] [--fake-media] [--stealth]
+               [--single-process auto|on|off] [--viewport WxH] [--mobile] [--scale N]
+                                Launch Chrome (headless by default, --show for visible)
+                                --single-process defaults to "auto" (on under gVisor, off elsewhere)
   rodney connect <host:port>      Connect to existing Chrome on remote debug port
   rodney stop                     Shut down Chrome
   rodney status                   Show browser status
@@ -21,8 +24,11 @@ Page info:
   rodney attr <selector> <name>   Print attribute value
   rodney pdf [file]               Save page as PDF
 
+Console:
+  rodney logs [-f] [-n N] [--json]  Print console logs (default: snapshot, -f to stream)
+
 Interaction:
-  rodney js <expression>          Evaluate JavaScript expression
+  rodney js <expression>|-        Evaluate JavaScript expression (- reads from stdin)
   rodney click <selector>         Click an element
   rodney input <selector> <text>  Type text into an input field
   rodney clear <selector>         Clear an input field
@@ -44,6 +50,10 @@ Screenshots:
   rodney screenshot [-w N] [-h N] [file]  Take page screenshot
   rodney screenshot-el <sel> [f]  Screenshot an element
 
+Viewport:
+  rodney viewport <w> <h> [--scale N] [--mobile]  Set viewport size
+  rodney viewport --reset                          Reset to browser default
+
 Tabs:
   rodney pages                    List all pages/tabs
   rodney page <index>             Switch to page by index
@@ -54,7 +64,10 @@ Element checks:
   rodney exists <selector>        Check if element exists (exit 1 if not)
   rodney count <selector>         Count matching elements
   rodney visible <selector>       Check if element is visible (exit 1 if not)
-  rodney assert <expr> [expected] [-m msg]  Assert JS expression (truthy or equality)
+  rodney assert <expr>|- [expected] [-m msg]  Assert JS expression (truthy or equality; - reads expr from stdin)
+
+Discovery:
+  rodney discover [--json] [--attr NAME]    List data-testid elements with suggested commands
 
 Accessibility:
   rodney ax-tree [--depth N] [--json]       Dump accessibility tree
