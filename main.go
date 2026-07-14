@@ -344,25 +344,26 @@ func withPage() (*State, *rod.Browser, *rod.Page) {
 
 // parseStartArgs parses the flags for the "start" command.
 // Returns ignoreCertErrors, headless, and an error for unknown flags.
-func parseStartArgs(args []string) (ignoreCertErrors bool, headless bool, err error) {
+func parseStartArgs(args []string) (ignoreCertErrors bool, headless bool, noGPU bool, err error) {
 	fs := flag.NewFlagSet("start", flag.ContinueOnError)
 	fs.SetOutput(io.Discard)
 	fs.BoolVar(&ignoreCertErrors, "insecure", false, "")
 	fs.BoolVar(&ignoreCertErrors, "k", false, "")
 	show := fs.Bool("show", false, "")
+	fs.BoolVar(&noGPU, "no-gpu", false, "")
 
 	if parseErr := fs.Parse(args); parseErr != nil {
-		return false, true, fmt.Errorf("unknown flag: %s\nusage: rodney start [--show] [--insecure]", findUnknownFlag(args, fs))
+		return false, true, false, fmt.Errorf("unknown flag: %s\nusage: rodney start [--show] [--insecure] [--no-gpu]", findUnknownFlag(args, fs))
 	}
 	if fs.NArg() > 0 {
-		return false, true, fmt.Errorf("unknown flag: %s\nusage: rodney start [--show] [--insecure]", fs.Arg(0))
+		return false, true, false, fmt.Errorf("unknown flag: %s\nusage: rodney start [--show] [--insecure] [--no-gpu]", fs.Arg(0))
 	}
 	headless = !*show
-	return ignoreCertErrors, headless, nil
+	return ignoreCertErrors, headless, noGPU, nil
 }
 
 func cmdStart(args []string) {
-	ignoreCertErrors, headless, err := parseStartArgs(args)
+	ignoreCertErrors, headless, noGPU, err := parseStartArgs(args)
 	if err != nil {
 		fatal("%s", err)
 	}
@@ -382,11 +383,16 @@ func cmdStart(args []string) {
 
 	l := launcher.New().
 		Set("no-sandbox").
-		Set("disable-gpu").
 		Set("single-process"). // Required for screenshots in gVisor/container environments
 		Leakless(false).       // Keep Chrome alive after CLI exits
 		UserDataDir(dataDir).
 		Headless(headless)
+
+	// GPU stays on by default so WebGL and 3D content render. Containers and VMs
+	// (Docker, Colima, Lima, gVisor) often have no usable GPU: --no-gpu for those.
+	if noGPU {
+		l = l.Set("disable-gpu")
+	}
 
 	// When in non-headless mode, make sure that we show the startup window immediately
 	// (instead of showing a window only after calling "rodney open")

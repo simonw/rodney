@@ -1,7 +1,10 @@
 rodney - Chrome automation from the command line
 
 Browser lifecycle:
-  rodney start [--show] [--insecure | -k]  Launch Chrome (headless by default, --show for visible)
+  rodney start [--show] [--insecure | -k] [--no-gpu]
+                                  Launch Chrome (headless by default, --show for visible)
+                                  --no-gpu disables GPU acceleration; needed in containers
+                                  and VMs (Docker, Colima, Lima) with no usable GPU
   rodney connect <host:port>      Connect to existing Chrome on remote debug port
   rodney stop                     Shut down Chrome
   rodney status                   Show browser status
@@ -79,6 +82,8 @@ Use "rodney start --local" to create a directory-scoped session.
 
 Environment:
   RODNEY_HOME                     Override data directory (default: ~/.rodney)
+  ROD_CHROME_BIN                  Use a specific Chrome/Chromium binary instead
+                                  of the downloaded one (e.g. your installed Chrome)
 
 Exit codes:
   0  Success
