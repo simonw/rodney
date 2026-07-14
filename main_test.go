@@ -1333,7 +1333,7 @@ func TestFormatAssertFail_EqualityWithMessage(t *testing.T) {
 // =====================
 
 func TestParseStartArgs_NoFlags(t *testing.T) {
-	insecure, headless, err := parseStartArgs([]string{})
+	insecure, headless, noGPU, err := parseStartArgs([]string{})
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
@@ -1343,10 +1343,42 @@ func TestParseStartArgs_NoFlags(t *testing.T) {
 	if !headless {
 		t.Error("expected headless=true with no flags")
 	}
+	if noGPU {
+		t.Error("expected noGPU=false with no flags: GPU is enabled by default")
+	}
+}
+
+func TestParseStartArgs_NoGPUFlag(t *testing.T) {
+	insecure, headless, noGPU, err := parseStartArgs([]string{"--no-gpu"})
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if !noGPU {
+		t.Error("expected noGPU=true when --no-gpu is passed")
+	}
+	if insecure {
+		t.Error("expected insecure=false")
+	}
+	if !headless {
+		t.Error("expected headless=true when only --no-gpu is passed")
+	}
+}
+
+func TestParseStartArgs_ShowAndNoGPU(t *testing.T) {
+	_, headless, noGPU, err := parseStartArgs([]string{"--show", "--no-gpu"})
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if !noGPU {
+		t.Error("expected noGPU=true")
+	}
+	if headless {
+		t.Error("expected headless=false when --show is passed")
+	}
 }
 
 func TestParseStartArgs_ShowFlag(t *testing.T) {
-	insecure, headless, err := parseStartArgs([]string{"--show"})
+	insecure, headless, _, err := parseStartArgs([]string{"--show"})
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
@@ -1359,7 +1391,7 @@ func TestParseStartArgs_ShowFlag(t *testing.T) {
 }
 
 func TestParseStartArgs_InsecureFlag(t *testing.T) {
-	insecure, headless, err := parseStartArgs([]string{"--insecure"})
+	insecure, headless, _, err := parseStartArgs([]string{"--insecure"})
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
@@ -1372,7 +1404,7 @@ func TestParseStartArgs_InsecureFlag(t *testing.T) {
 }
 
 func TestParseStartArgs_InsecureShortFlag(t *testing.T) {
-	insecure, _, err := parseStartArgs([]string{"-k"})
+	insecure, _, _, err := parseStartArgs([]string{"-k"})
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
@@ -1382,7 +1414,7 @@ func TestParseStartArgs_InsecureShortFlag(t *testing.T) {
 }
 
 func TestParseStartArgs_ShowAndInsecure(t *testing.T) {
-	insecure, headless, err := parseStartArgs([]string{"--show", "--insecure"})
+	insecure, headless, _, err := parseStartArgs([]string{"--show", "--insecure"})
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
@@ -1395,7 +1427,7 @@ func TestParseStartArgs_ShowAndInsecure(t *testing.T) {
 }
 
 func TestParseStartArgs_UnknownFlag(t *testing.T) {
-	_, _, err := parseStartArgs([]string{"--bogus"})
+	_, _, _, err := parseStartArgs([]string{"--bogus"})
 	if err == nil {
 		t.Fatal("expected error for unknown flag --bogus")
 	}
