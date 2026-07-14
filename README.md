@@ -99,6 +99,11 @@ rodney select "#dropdown" "value"  # Select dropdown by value
 rodney submit "form#login"         # Submit a form
 rodney hover ".menu-item"          # Hover over element
 rodney focus "#email"              # Focus element
+rodney cookie set session abc123 --domain example.com
+rodney cookie set prefs dark --domain example.com --path /app --http-only --same-site lax
+rodney cookie list                  # List cookies for current page URL
+rodney cookie get session           # Print just the cookie value
+rodney cookie delete session --domain example.com
 ```
 
 ### Wait for conditions

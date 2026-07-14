@@ -14,6 +14,7 @@ import (
 	"os/exec"
 	"os/signal"
 	"path/filepath"
+	"sort"
 	"strconv"
 	"strings"
 	"syscall"
@@ -79,12 +80,12 @@ func resolveStateDir(mode scopeMode, workingDir string) string {
 
 // State persisted between CLI invocations
 type State struct {
-	DebugURL    string `json:"debug_url"`
-	ChromePID   int    `json:"chrome_pid"`
-	ActivePage  int    `json:"active_page"`  // index into pages list
-	DataDir     string `json:"data_dir"`
-	ProxyPID    int    `json:"proxy_pid,omitempty"`  // PID of auth proxy helper
-	ProxyPort   int    `json:"proxy_port,omitempty"` // local port of auth proxy
+	DebugURL   string `json:"debug_url"`
+	ChromePID  int    `json:"chrome_pid"`
+	ActivePage int    `json:"active_page"` // index into pages list
+	DataDir    string `json:"data_dir"`
+	ProxyPID   int    `json:"proxy_pid,omitempty"`  // PID of auth proxy helper
+	ProxyPort  int    `json:"proxy_port,omitempty"` // local port of auth proxy
 }
 
 func stateDir() string {
@@ -257,6 +258,8 @@ func main() {
 		cmdDownload(args)
 	case "focus":
 		cmdFocus(args)
+	case "cookie":
+		cmdCookie(args)
 	case "wait":
 		cmdWait(args)
 	case "waitload":
@@ -306,6 +309,9 @@ func main() {
 // Default timeout for element queries (seconds)
 var defaultTimeout = 30 * time.Second
 
+const cookieSetUsage = "usage: rodney cookie set <name> <value> --domain <domain> [--path <path>] [--secure] [--http-only] [--same-site <strict|lax|none>]"
+const cookieDeleteUsage = "usage: rodney cookie delete <name> --domain <domain> [--path <path>]"
+
 func init() {
 	if t := os.Getenv("ROD_TIMEOUT"); t != "" {
 		if secs, err := strconv.ParseFloat(t, 64); err == nil {
@@ -338,25 +344,26 @@ func withPage() (*State, *rod.Browser, *rod.Page) {
 
 // parseStartArgs parses the flags for the "start" command.
 // Returns ignoreCertErrors, headless, and an error for unknown flags.
-func parseStartArgs(args []string) (ignoreCertErrors bool, headless bool, err error) {
+func parseStartArgs(args []string) (ignoreCertErrors bool, headless bool, noGPU bool, err error) {
 	fs := flag.NewFlagSet("start", flag.ContinueOnError)
 	fs.SetOutput(io.Discard)
 	fs.BoolVar(&ignoreCertErrors, "insecure", false, "")
 	fs.BoolVar(&ignoreCertErrors, "k", false, "")
 	show := fs.Bool("show", false, "")
+	fs.BoolVar(&noGPU, "no-gpu", false, "")
 
 	if parseErr := fs.Parse(args); parseErr != nil {
-		return false, true, fmt.Errorf("unknown flag: %s\nusage: rodney start [--show] [--insecure]", findUnknownFlag(args, fs))
+		return false, true, false, fmt.Errorf("unknown flag: %s\nusage: rodney start [--show] [--insecure] [--no-gpu]", findUnknownFlag(args, fs))
 	}
 	if fs.NArg() > 0 {
-		return false, true, fmt.Errorf("unknown flag: %s\nusage: rodney start [--show] [--insecure]", fs.Arg(0))
+		return false, true, false, fmt.Errorf("unknown flag: %s\nusage: rodney start [--show] [--insecure] [--no-gpu]", fs.Arg(0))
 	}
 	headless = !*show
-	return ignoreCertErrors, headless, nil
+	return ignoreCertErrors, headless, noGPU, nil
 }
 
 func cmdStart(args []string) {
-	ignoreCertErrors, headless, err := parseStartArgs(args)
+	ignoreCertErrors, headless, noGPU, err := parseStartArgs(args)
 	if err != nil {
 		fatal("%s", err)
 	}
@@ -376,11 +383,16 @@ func cmdStart(args []string) {
 
 	l := launcher.New().
 		Set("no-sandbox").
-		Set("disable-gpu").
 		Set("single-process"). // Required for screenshots in gVisor/container environments
-		Leakless(false).        // Keep Chrome alive after CLI exits
+		Leakless(false).       // Keep Chrome alive after CLI exits
 		UserDataDir(dataDir).
 		Headless(headless)
+
+	// GPU stays on by default so WebGL and 3D content render. Containers and VMs
+	// (Docker, Colima, Lima, gVisor) often have no usable GPU: --no-gpu for those.
+	if noGPU {
+		l = l.Set("disable-gpu")
+	}
 
 	// When in non-headless mode, make sure that we show the startup window immediately
 	// (instead of showing a window only after calling "rodney open")
@@ -1066,6 +1078,315 @@ func cmdFocus(args []string) {
 	fmt.Println("Focused")
 }
 
+type cookieSetOptions struct {
+	Name     string
+	Value    string
+	Domain   string
+	Path     string
+	Secure   bool
+	HTTPOnly bool
+	SameSite proto.NetworkCookieSameSite
+}
+
+type cookieDeleteOptions struct {
+	Name   string
+	Domain string
+	Path   string
+}
+
+func cmdCookie(args []string) {
+	if len(args) == 0 {
+		fatal("usage: rodney cookie <subcommand>")
+	}
+
+	switch args[0] {
+	case "set":
+		cmdCookieSet(args[1:])
+	case "list":
+		cmdCookieList(args[1:])
+	case "get":
+		cmdCookieGet(args[1:])
+	case "delete":
+		cmdCookieDelete(args[1:])
+	default:
+		fatal("unknown cookie subcommand: %s\nusage: rodney cookie <set|list|get|delete>", args[0])
+	}
+}
+
+func cmdCookieSet(args []string) {
+	opts, err := parseCookieSetArgs(args)
+	if err != nil {
+		fatal("%s", err)
+	}
+
+	_, _, page := withPage()
+	if err := setCookie(page, opts); err != nil {
+		fatal("failed to set cookie: %v", err)
+	}
+
+	fmt.Printf("Set cookie %s for %s\n", opts.Name, opts.Domain)
+}
+
+func cmdCookieList(args []string) {
+	if len(args) > 0 {
+		fatal("usage: rodney cookie list")
+	}
+
+	_, _, page := withPage()
+	cookies, err := listCookies(page)
+	if err != nil {
+		fatal("failed to list cookies: %v", err)
+	}
+	if len(cookies) == 0 {
+		return
+	}
+	fmt.Print(formatCookieList(cookies))
+}
+
+func cmdCookieGet(args []string) {
+	if len(args) != 1 {
+		fatal("usage: rodney cookie get <name>")
+	}
+
+	_, _, page := withPage()
+	cookie, err := getCookie(page, args[0])
+	if err != nil {
+		fatal("failed to get cookie: %v", err)
+	}
+	if cookie == nil {
+		fmt.Fprintf(os.Stderr, "cookie not found: %s\n", args[0])
+		os.Exit(1)
+	}
+	fmt.Println(cookie.Value)
+}
+
+func cmdCookieDelete(args []string) {
+	opts, err := parseCookieDeleteArgs(args)
+	if err != nil {
+		fatal("%s", err)
+	}
+
+	_, _, page := withPage()
+	cookie, err := getCookie(page, opts.Name)
+	if err != nil {
+		fatal("failed to check cookie: %v", err)
+	}
+	if cookie == nil || cookie.Domain != opts.Domain || cookie.Path != opts.Path {
+		fmt.Fprintf(os.Stderr, "cookie not found: %s\n", opts.Name)
+		os.Exit(1)
+	}
+
+	if err := deleteCookie(page, opts); err != nil {
+		fatal("failed to delete cookie: %v", err)
+	}
+
+	fmt.Printf("Deleted cookie %s for %s\n", opts.Name, opts.Domain)
+}
+
+func parseCookieSetArgs(args []string) (cookieSetOptions, error) {
+	opts := cookieSetOptions{Path: "/"}
+	positionals := make([]string, 0, 2)
+
+	for i := 0; i < len(args); i++ {
+		arg := args[i]
+
+		switch {
+		case arg == "--domain":
+			if i+1 >= len(args) {
+				return cookieSetOptions{}, fmt.Errorf("missing value for --domain\n%s", cookieSetUsage)
+			}
+			i++
+			opts.Domain = args[i]
+		case strings.HasPrefix(arg, "--domain="):
+			opts.Domain = strings.TrimPrefix(arg, "--domain=")
+		case arg == "--path":
+			if i+1 >= len(args) {
+				return cookieSetOptions{}, fmt.Errorf("missing value for --path\n%s", cookieSetUsage)
+			}
+			i++
+			opts.Path = args[i]
+		case strings.HasPrefix(arg, "--path="):
+			opts.Path = strings.TrimPrefix(arg, "--path=")
+		case arg == "--secure":
+			opts.Secure = true
+		case arg == "--http-only":
+			opts.HTTPOnly = true
+		case arg == "--same-site":
+			if i+1 >= len(args) {
+				return cookieSetOptions{}, fmt.Errorf("missing value for --same-site\n%s", cookieSetUsage)
+			}
+			i++
+			sameSite, err := parseCookieSameSite(args[i])
+			if err != nil {
+				return cookieSetOptions{}, fmt.Errorf("%w\n%s", err, cookieSetUsage)
+			}
+			opts.SameSite = sameSite
+		case strings.HasPrefix(arg, "--same-site="):
+			sameSite, err := parseCookieSameSite(strings.TrimPrefix(arg, "--same-site="))
+			if err != nil {
+				return cookieSetOptions{}, fmt.Errorf("%w\n%s", err, cookieSetUsage)
+			}
+			opts.SameSite = sameSite
+		case strings.HasPrefix(arg, "-"):
+			return cookieSetOptions{}, fmt.Errorf("unknown flag: %s\n%s", arg, cookieSetUsage)
+		default:
+			positionals = append(positionals, arg)
+		}
+	}
+
+	if len(positionals) < 2 {
+		return cookieSetOptions{}, fmt.Errorf("missing cookie name or value\n%s", cookieSetUsage)
+	}
+	if len(positionals) > 2 {
+		return cookieSetOptions{}, fmt.Errorf("too many arguments: %s\n%s", positionals[2], cookieSetUsage)
+	}
+	if opts.Domain == "" {
+		return cookieSetOptions{}, fmt.Errorf("missing required flag: --domain\n%s", cookieSetUsage)
+	}
+
+	opts.Name = positionals[0]
+	opts.Value = positionals[1]
+	return opts, nil
+}
+
+func parseCookieSameSite(value string) (proto.NetworkCookieSameSite, error) {
+	switch strings.ToLower(value) {
+	case "strict":
+		return proto.NetworkCookieSameSiteStrict, nil
+	case "lax":
+		return proto.NetworkCookieSameSiteLax, nil
+	case "none":
+		return proto.NetworkCookieSameSiteNone, nil
+	default:
+		return "", fmt.Errorf("invalid --same-site value: %s", value)
+	}
+}
+
+func parseCookieDeleteArgs(args []string) (cookieDeleteOptions, error) {
+	opts := cookieDeleteOptions{Path: "/"}
+	positionals := make([]string, 0, 1)
+
+	for i := 0; i < len(args); i++ {
+		arg := args[i]
+
+		switch {
+		case arg == "--domain":
+			if i+1 >= len(args) {
+				return cookieDeleteOptions{}, fmt.Errorf("missing value for --domain\n%s", cookieDeleteUsage)
+			}
+			i++
+			opts.Domain = args[i]
+		case strings.HasPrefix(arg, "--domain="):
+			opts.Domain = strings.TrimPrefix(arg, "--domain=")
+		case arg == "--path":
+			if i+1 >= len(args) {
+				return cookieDeleteOptions{}, fmt.Errorf("missing value for --path\n%s", cookieDeleteUsage)
+			}
+			i++
+			opts.Path = args[i]
+		case strings.HasPrefix(arg, "--path="):
+			opts.Path = strings.TrimPrefix(arg, "--path=")
+		case strings.HasPrefix(arg, "-"):
+			return cookieDeleteOptions{}, fmt.Errorf("unknown flag: %s\n%s", arg, cookieDeleteUsage)
+		default:
+			positionals = append(positionals, arg)
+		}
+	}
+
+	if len(positionals) < 1 {
+		return cookieDeleteOptions{}, fmt.Errorf("missing cookie name\n%s", cookieDeleteUsage)
+	}
+	if len(positionals) > 1 {
+		return cookieDeleteOptions{}, fmt.Errorf("too many arguments: %s\n%s", positionals[1], cookieDeleteUsage)
+	}
+	if opts.Domain == "" {
+		return cookieDeleteOptions{}, fmt.Errorf("missing required flag: --domain\n%s", cookieDeleteUsage)
+	}
+
+	opts.Name = positionals[0]
+	return opts, nil
+}
+
+func setCookie(page *rod.Page, opts cookieSetOptions) error {
+	params := proto.NetworkSetCookie{
+		Name:     opts.Name,
+		Value:    opts.Value,
+		Domain:   opts.Domain,
+		Path:     opts.Path,
+		Secure:   opts.Secure,
+		HTTPOnly: opts.HTTPOnly,
+		SameSite: opts.SameSite,
+	}
+
+	if _, err := params.Call(page); err != nil {
+		return err
+	}
+	return nil
+}
+
+func listCookies(page *rod.Page) ([]*proto.NetworkCookie, error) {
+	info, err := page.Info()
+	if err != nil {
+		return nil, err
+	}
+	result, err := proto.NetworkGetCookies{Urls: []string{info.URL}}.Call(page)
+	if err != nil {
+		return nil, err
+	}
+	return result.Cookies, nil
+}
+
+func getCookie(page *rod.Page, name string) (*proto.NetworkCookie, error) {
+	cookies, err := listCookies(page)
+	if err != nil {
+		return nil, err
+	}
+	return findCookie(cookies, name), nil
+}
+
+func deleteCookie(page *rod.Page, opts cookieDeleteOptions) error {
+	return proto.NetworkDeleteCookies{
+		Name:   opts.Name,
+		Domain: opts.Domain,
+		Path:   opts.Path,
+	}.Call(page)
+}
+
+func formatCookieList(cookies []*proto.NetworkCookie) string {
+	if len(cookies) == 0 {
+		return ""
+	}
+
+	sorted := append([]*proto.NetworkCookie(nil), cookies...)
+	sort.Slice(sorted, func(i, j int) bool {
+		if sorted[i].Name == sorted[j].Name {
+			if sorted[i].Domain == sorted[j].Domain {
+				return sorted[i].Path < sorted[j].Path
+			}
+			return sorted[i].Domain < sorted[j].Domain
+		}
+		return sorted[i].Name < sorted[j].Name
+	})
+
+	var sb strings.Builder
+	for _, cookie := range sorted {
+		sb.WriteString(cookie.Name)
+		sb.WriteString("=")
+		sb.WriteString(cookie.Value)
+		sb.WriteString("\n")
+	}
+	return sb.String()
+}
+
+func findCookie(cookies []*proto.NetworkCookie, name string) *proto.NetworkCookie {
+	for _, cookie := range cookies {
+		if cookie.Name == name {
+			return cookie
+		}
+	}
+	return nil
+}
+
 func cmdWait(args []string) {
 	if len(args) < 1 {
 		fatal("usage: rodney wait <selector>")
@@ -1611,7 +1932,7 @@ func queryAXNodes(page *rod.Page, name, role string) ([]*proto.AccessibilityAXNo
 	}
 
 	result, err := proto.AccessibilityQueryAXTree{
-		BackendNodeID: doc.Root.BackendNodeID,
+		BackendNodeID:  doc.Root.BackendNodeID,
 		AccessibleName: name,
 		Role:           role,
 	}.Call(page)
