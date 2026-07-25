@@ -49,6 +49,45 @@ rodney status             # Show browser info and active page
 rodney stop               # Shut down Chrome
 ```
 
+### Browser extensions
+
+`--extension` loads a Chrome extension at startup. It works in headless mode as
+well as with `--show`:
+
+```bash
+# An unpacked extension directory
+rodney start --extension ./my-extension
+
+# A packed .crx or .zip, which is unpacked into the session directory
+rodney start --extension ./my-extension.crx
+
+# Repeat the flag to load more than one
+rodney start --extension ./one --extension ./two
+```
+
+`rodney extensions` lists what was loaded, including the ID Chrome assigned to
+each one, which you need to reach pages served by the extension:
+
+```bash
+rodney extensions
+# ldmakemplfmadpiihagnajidjbhnjlcm  My Extension  1.0.0  /path/to/my-extension
+
+rodney open chrome-extension://ldmakemplfmadpiihagnajidjbhnjlcm/popup.html
+rodney screenshot popup.png
+```
+
+Notes:
+
+- Extensions run in Chrome's [new headless
+  mode](https://developer.chrome.com/docs/chromium/new-headless), which rodney
+  switches to automatically when `--extension` is used — the old headless mode
+  cannot run extensions at all.
+- Chrome only loads *unpacked* extensions from the command line, so a `.crx` is
+  unpacked before being loaded. It therefore gets an ID derived from its path on
+  disk rather than the ID it would have when installed from the Web Store.
+- Only the extensions passed to `--extension` are enabled, and they stay loaded
+  for the lifetime of the session.
+
 ### Navigate
 
 ```bash

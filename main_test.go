@@ -1079,69 +1079,69 @@ func TestFormatAssertFail_EqualityWithMessage(t *testing.T) {
 // =====================
 
 func TestParseStartArgs_NoFlags(t *testing.T) {
-	insecure, headless, err := parseStartArgs([]string{})
+	opts, err := parseStartArgs([]string{})
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
-	if insecure {
+	if opts.ignoreCertErrors {
 		t.Error("expected insecure=false with no flags")
 	}
-	if !headless {
+	if !opts.headless {
 		t.Error("expected headless=true with no flags")
 	}
 }
 
 func TestParseStartArgs_ShowFlag(t *testing.T) {
-	insecure, headless, err := parseStartArgs([]string{"--show"})
+	opts, err := parseStartArgs([]string{"--show"})
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
-	if insecure {
+	if opts.ignoreCertErrors {
 		t.Error("expected insecure=false")
 	}
-	if headless {
+	if opts.headless {
 		t.Error("expected headless=false when --show is passed")
 	}
 }
 
 func TestParseStartArgs_InsecureFlag(t *testing.T) {
-	insecure, headless, err := parseStartArgs([]string{"--insecure"})
+	opts, err := parseStartArgs([]string{"--insecure"})
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
-	if !insecure {
+	if !opts.ignoreCertErrors {
 		t.Error("expected insecure=true when --insecure is passed")
 	}
-	if !headless {
+	if !opts.headless {
 		t.Error("expected headless=true when only --insecure is passed")
 	}
 }
 
 func TestParseStartArgs_InsecureShortFlag(t *testing.T) {
-	insecure, _, err := parseStartArgs([]string{"-k"})
+	opts, err := parseStartArgs([]string{"-k"})
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
-	if !insecure {
+	if !opts.ignoreCertErrors {
 		t.Error("expected insecure=true when -k is passed")
 	}
 }
 
 func TestParseStartArgs_ShowAndInsecure(t *testing.T) {
-	insecure, headless, err := parseStartArgs([]string{"--show", "--insecure"})
+	opts, err := parseStartArgs([]string{"--show", "--insecure"})
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
-	if !insecure {
+	if !opts.ignoreCertErrors {
 		t.Error("expected insecure=true")
 	}
-	if headless {
+	if opts.headless {
 		t.Error("expected headless=false when --show is passed")
 	}
 }
 
 func TestParseStartArgs_UnknownFlag(t *testing.T) {
-	_, _, err := parseStartArgs([]string{"--bogus"})
+	_, err := parseStartArgs([]string{"--bogus"})
 	if err == nil {
 		t.Fatal("expected error for unknown flag --bogus")
 	}

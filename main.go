@@ -85,6 +85,8 @@ type State struct {
 	DataDir     string `json:"data_dir"`
 	ProxyPID    int    `json:"proxy_pid,omitempty"`  // PID of auth proxy helper
 	ProxyPort   int    `json:"proxy_port,omitempty"` // local port of auth proxy
+
+	Extensions []extensionInfo `json:"extensions,omitempty"` // extensions passed to --load-extension
 }
 
 func stateDir() string {
@@ -215,6 +217,8 @@ func main() {
 		cmdStop(args)
 	case "status":
 		cmdStatus(args)
+	case "extensions":
+		cmdExtensions(args)
 	case "open":
 		cmdOpen(args)
 	case "back":
@@ -336,30 +340,44 @@ func withPage() (*State, *rod.Browser, *rod.Page) {
 
 // --- Commands ---
 
+const startUsage = "usage: rodney start [--show] [--insecure] [--extension PATH]"
+
+// startOptions holds the parsed flags for the "start" command.
+type startOptions struct {
+	ignoreCertErrors bool
+	headless         bool
+	extensions       []string
+}
+
 // parseStartArgs parses the flags for the "start" command.
-// Returns ignoreCertErrors, headless, and an error for unknown flags.
-func parseStartArgs(args []string) (ignoreCertErrors bool, headless bool, err error) {
+func parseStartArgs(args []string) (startOptions, error) {
+	opts := startOptions{headless: true}
+	var extensions extensionList
+
 	fs := flag.NewFlagSet("start", flag.ContinueOnError)
 	fs.SetOutput(io.Discard)
-	fs.BoolVar(&ignoreCertErrors, "insecure", false, "")
-	fs.BoolVar(&ignoreCertErrors, "k", false, "")
+	fs.BoolVar(&opts.ignoreCertErrors, "insecure", false, "")
+	fs.BoolVar(&opts.ignoreCertErrors, "k", false, "")
+	fs.Var(&extensions, "extension", "")
 	show := fs.Bool("show", false, "")
 
 	if parseErr := fs.Parse(args); parseErr != nil {
-		return false, true, fmt.Errorf("unknown flag: %s\nusage: rodney start [--show] [--insecure]", findUnknownFlag(args, fs))
+		return startOptions{headless: true}, fmt.Errorf("unknown flag: %s\n%s", findUnknownFlag(args, fs), startUsage)
 	}
 	if fs.NArg() > 0 {
-		return false, true, fmt.Errorf("unknown flag: %s\nusage: rodney start [--show] [--insecure]", fs.Arg(0))
+		return startOptions{headless: true}, fmt.Errorf("unknown flag: %s\n%s", fs.Arg(0), startUsage)
 	}
-	headless = !*show
-	return ignoreCertErrors, headless, nil
+	opts.headless = !*show
+	opts.extensions = extensions
+	return opts, nil
 }
 
 func cmdStart(args []string) {
-	ignoreCertErrors, headless, err := parseStartArgs(args)
+	opts, err := parseStartArgs(args)
 	if err != nil {
 		fatal("%s", err)
 	}
+	ignoreCertErrors, headless := opts.ignoreCertErrors, opts.headless
 
 	// Check if already running
 	if s, err := loadState(); err == nil {
@@ -374,6 +392,8 @@ func cmdStart(args []string) {
 	dataDir := filepath.Join(stateDir(), "chrome-data")
 	os.MkdirAll(dataDir, 0755)
 
+	extensions := loadExtensions(opts.extensions)
+
 	l := launcher.New().
 		Set("no-sandbox").
 		Set("disable-gpu").
@@ -387,6 +407,8 @@ func cmdStart(args []string) {
 	if !headless {
 		l = l.Delete("no-startup-window")
 	}
+
+	l = configureExtensions(l, headless, extensions)
 
 	if bin := os.Getenv("ROD_CHROME_BIN"); bin != "" {
 		l = l.Bin(bin)
@@ -441,6 +463,7 @@ func cmdStart(args []string) {
 		DataDir:    dataDir,
 		ProxyPID:   proxyPID,
 		ProxyPort:  proxyPort,
+		Extensions: extensions,
 	}
 
 	if err := saveState(state); err != nil {
@@ -449,6 +472,43 @@ func cmdStart(args []string) {
 
 	fmt.Printf("Chrome started (PID %d)\n", pid)
 	fmt.Printf("Debug URL: %s\n", debugURL)
+	for _, ext := range extensions {
+		fmt.Printf("Extension loaded: %s (%s)\n", ext.Name, ext.ID)
+	}
+}
+
+// loadExtensions resolves --extension paths into directories Chrome can load,
+// unpacking .crx/.zip archives into the session directory as needed.
+func loadExtensions(paths []string) []extensionInfo {
+	if len(paths) == 0 {
+		return nil
+	}
+	unpackRoot := filepath.Join(stateDir(), "extensions")
+	if err := os.MkdirAll(unpackRoot, 0755); err != nil {
+		fatal("failed to create extension directory: %v", err)
+	}
+	extensions := make([]extensionInfo, 0, len(paths))
+	for _, path := range paths {
+		info, err := resolveExtension(path, unpackRoot)
+		if err != nil {
+			fatal("%v", err)
+		}
+		extensions = append(extensions, info)
+	}
+	return extensions
+}
+
+func cmdExtensions(args []string) {
+	if len(args) > 0 {
+		fatal("usage: rodney extensions")
+	}
+	s, err := loadState()
+	if err != nil {
+		fatal("%v", err)
+	}
+	for _, ext := range s.Extensions {
+		fmt.Printf("%s  %s  %s  %s\n", ext.ID, ext.Name, ext.Version, ext.Dir)
+	}
 }
 
 func cmdConnect(args []string) {
@@ -542,6 +602,9 @@ func cmdStatus(args []string) {
 	fmt.Printf("Debug URL: %s\n", s.DebugURL)
 	fmt.Printf("Pages: %d\n", len(pages))
 	fmt.Printf("Active page: %d\n", s.ActivePage)
+	for _, ext := range s.Extensions {
+		fmt.Printf("Extension: %s (%s)\n", ext.Name, ext.ID)
+	}
 	if page, err := getActivePage(browser, s); err == nil {
 		info, _ := page.Info()
 		if info != nil {

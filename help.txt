@@ -1,10 +1,14 @@
 rodney - Chrome automation from the command line
 
 Browser lifecycle:
-  rodney start [--show] [--insecure | -k]  Launch Chrome (headless by default, --show for visible)
+  rodney start [--show] [--insecure | -k] [--extension PATH]
+                                  Launch Chrome (headless by default, --show for visible)
+                                  --extension loads an unpacked directory or a
+                                  .crx/.zip archive; repeat for several
   rodney connect <host:port>      Connect to existing Chrome on remote debug port
   rodney stop                     Shut down Chrome
   rodney status                   Show browser status
+  rodney extensions               List extensions loaded into this session
 
 Navigation:
   rodney open <url>               Navigate to URL
