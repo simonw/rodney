@@ -120,6 +120,32 @@ For a CLI automation tool that controls one page at a time, these trade-offs
 are acceptable. The stability concern is mitigated by the fact that `rodney stop`
 and `rodney start` can quickly restart Chrome.
 
+## Not applied on macOS
+
+The "a crash takes down the whole browser" trade-off turned out to be more than
+theoretical on macOS, so `rodney start` skips `--single-process` there
+(`singleProcessSupported` in `chrome_flags.go`).
+
+`media/capture`'s Apple backend CHECKs that it owns a CFRunLoop-enabled thread,
+which only holds when video capture runs in a utility process of its own. Under
+`--single-process` that CHECK fails and aborts the browser:
+
+```
+FATAL:video_capture_device_factory_apple.mm(37)] Check failed: mode.
+The MacOS video capture code must be run on a CFRunLoop-enabled thread
+```
+
+Any page calling `navigator.mediaDevices.enumerateDevices()` triggers it, which
+the device-fingerprinting scripts on most commercial sites do:
+
+```bash
+rodney open https://example.com/
+rodney js "navigator.mediaDevices.enumerateDevices().then(d=>d.length)"
+```
+
+gVisor is a Linux sandbox, so nothing in this investigation is lost by skipping
+the flag on Darwin. Linux and Windows keep it.
+
 ## Reproducing
 
 The test script `screenshot_test.go` in this directory reproduces the investigation.
