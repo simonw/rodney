@@ -334,6 +334,27 @@ func withPage() (*State, *rod.Browser, *rod.Page) {
 	return s, browser, page
 }
 
+// bringToFront makes page the browser's foreground target.
+//
+// rodney's "active page" is only an index in its own state file; the browser is
+// never told about it, so after "rodney page N" the foreground target is still
+// whichever one was opened last. DOM and JS commands do not care -- they read a
+// hidden target perfectly well -- but a backgrounded target has no compositor
+// producing frames, and Page.captureScreenshot simply waits for one that never
+// arrives until the context deadline expires:
+//
+//	error: screenshot failed: context deadline exceeded
+//
+// So every command that captures pixels has to raise its target first.
+//
+// Errors are deliberately ignored. Activation failing means the target or the
+// browser is gone, in which case the capture that follows reports the real
+// problem; turning that into an error here would only replace a good message
+// with a worse one, and would risk failing captures that would have worked.
+func bringToFront(page *rod.Page) {
+	_, _ = page.Activate()
+}
+
 // --- Commands ---
 
 // parseStartArgs parses the flags for the "start" command.
@@ -1150,6 +1171,7 @@ func cmdScreenshot(args []string) {
 	}
 
 	_, _, page := withPage()
+	bringToFront(page)
 
 	// Set viewport size
 	viewportHeight := *height
@@ -1184,6 +1206,7 @@ func cmdScreenshotEl(args []string) {
 		file = args[1]
 	}
 	_, _, page := withPage()
+	bringToFront(page)
 	el, err := page.Element(args[0])
 	if err != nil {
 		fatal("element not found: %v", err)
@@ -1252,6 +1275,9 @@ func cmdPage(args []string) {
 	if err := saveState(s); err != nil {
 		fatal("failed to save state: %v", err)
 	}
+	// Switch the browser too, not just our own index, so the page a caller just
+	// selected is the one being rendered.
+	bringToFront(pages[idx])
 	info, _ := pages[idx].Info()
 	if info != nil {
 		fmt.Printf("Switched to [%d] %s - %s\n", idx, info.Title, info.URL)
