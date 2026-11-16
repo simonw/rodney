@@ -1224,3 +1224,22 @@ func TestInsecureFlag_WithSelfSignedCert(t *testing.T) {
 		}
 	})
 }
+
+func TestNormalizeURL(t *testing.T) {
+	cases := map[string]string{
+		"example.com":                  "http://example.com",
+		"localhost:8080/x":             "http://localhost:8080/x",
+		"https://example.com":          "https://example.com",
+		"file:///tmp/a.html":           "file:///tmp/a.html",
+		"data:text/html,<p>hi</p>":     "data:text/html,<p>hi</p>",
+		"DATA:text/plain,x":            "DATA:text/plain,x",
+		"about:blank":                  "about:blank",
+		"javascript:void(0)":           "javascript:void(0)",
+		"blob:https://example.com/abc": "blob:https://example.com/abc",
+	}
+	for in, want := range cases {
+		if got := normalizeURL(in); got != want {
+			t.Errorf("normalizeURL(%q) = %q, want %q", in, got, want)
+		}
+	}
+}
