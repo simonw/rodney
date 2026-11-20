@@ -550,15 +550,26 @@ func cmdStatus(args []string) {
 	}
 }
 
+// normalizeURL adds http:// to a bare host such as "example.com" or
+// "localhost:8080". URLs with a scheme that has no "//" (data:, about:,
+// javascript:, blob:) pass through unchanged.
+func normalizeURL(url string) string {
+	if strings.Contains(url, "://") {
+		return url
+	}
+	for _, scheme := range []string{"data:", "about:", "javascript:", "blob:"} {
+		if strings.HasPrefix(strings.ToLower(url), scheme) {
+			return url
+		}
+	}
+	return "http://" + url
+}
+
 func cmdOpen(args []string) {
 	if len(args) < 1 {
 		fatal("usage: rodney open <url>")
 	}
-	url := args[0]
-	// Add scheme if missing
-	if !strings.Contains(url, "://") {
-		url = "http://" + url
-	}
+	url := normalizeURL(args[0])
 
 	s, err := loadState()
 	if err != nil {
@@ -1270,10 +1281,7 @@ func cmdNewPage(args []string) {
 
 	url := ""
 	if len(args) > 0 {
-		url = args[0]
-		if !strings.Contains(url, "://") {
-			url = "http://" + url
-		}
+		url = normalizeURL(args[0])
 	}
 
 	var page *rod.Page
